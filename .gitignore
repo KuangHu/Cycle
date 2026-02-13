@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pipeline output (large files live on shared storage, not in repo)
+*.bam
+*.bam.bai
+*.bai
+*.mmi
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.sam
+
+# SLURM logs
+slurm-*.out
