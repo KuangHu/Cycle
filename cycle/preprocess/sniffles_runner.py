@@ -78,9 +78,8 @@ class SnifflesRunner:
         # A. xylosoxidans: 2 insertions without --mosaic, 0 with --mosaic).
         # --no-qc disables quality filters for maximum sensitivity (found 235
         # insertions vs 2 with default QC on A. xylosoxidans test).
-        cmd = [
-            "sniffles",
-            "--input", ",".join(str(b) for b in bams),
+        # Build command - Sniffles2 accepts space-separated BAMs after --input
+        cmd = ["sniffles", "--input"] + [str(b) for b in bams] + [
             "--vcf", str(vcf_path),
             "--reference", str(ref_fasta),
             "--threads", "4",
