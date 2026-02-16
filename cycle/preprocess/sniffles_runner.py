@@ -84,10 +84,19 @@ class SnifflesRunner:
             bam_name = bam.stem.replace('.sorted', '')
             vcf_individual = org_dir / f"{bam_name}.vcf"
 
-            # Skip if already processed
+            # Skip if already processed with actual variants (not just headers)
+            skip_existing = False
             if vcf_individual.exists():
-                logger.debug(f"  [{i}/{len(bams)}] {bam_name} - using existing VCF")
-            else:
+                # Count non-header lines to see if VCF has variants
+                with open(vcf_individual) as f:
+                    variant_count = sum(1 for line in f if not line.startswith('#'))
+                if variant_count > 0:
+                    logger.debug(f"  [{i}/{len(bams)}] {bam_name} - using existing VCF ({variant_count} variants)")
+                    skip_existing = True
+                else:
+                    logger.debug(f"  [{i}/{len(bams)}] {bam_name} - reprocessing empty VCF")
+
+            if not skip_existing:
                 # Run Sniffles2 with sensitive settings
                 # --no-qc disables quality filters for maximum sensitivity
                 # --allow-overwrite permits reprocessing samples if needed
