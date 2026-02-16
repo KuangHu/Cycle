@@ -91,10 +91,10 @@ class SnifflesRunner:
                 with open(vcf_individual) as f:
                     variant_count = sum(1 for line in f if not line.startswith('#'))
                 if variant_count > 0:
-                    logger.debug(f"  [{i}/{len(bams)}] {bam_name} - using existing VCF ({variant_count} variants)")
+                    logger.info(f"  [{i}/{len(bams)}] {bam_name} - using existing VCF ({variant_count} variants)")
                     skip_existing = True
                 else:
-                    logger.debug(f"  [{i}/{len(bams)}] {bam_name} - reprocessing empty VCF")
+                    logger.info(f"  [{i}/{len(bams)}] {bam_name} - reprocessing empty VCF")
 
             if not skip_existing:
                 # Run Sniffles2 with sensitive settings
