@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """End-to-end pipeline: metadata TSV -> circle detection.
 
-Chains seven stages:
+Chains up to 8 stages:
   1. download  — fetch FASTQs via kingfisher
   2. resolve   — download one reference genome per organism via NCBI datasets
   3. index     — build minimap2 .mmi indices
   4. align     — minimap2 + samtools sort -> sorted BAM + .bai
-  5. is_ref    — build tldr-formatted IS element reference FASTA
-  6. tldr      — run tldr per organism group
+  5. is_ref    — build IS element reference FASTA (for tldr only)
+  6. tldr      — run tldr per organism group (IS detection via reference library)
+  6alt. sniffles — run Sniffles2 per organism (SV-based insertion detection, faster)
   7. circle    — detect IS circular intermediates via concatemer bait
 
-Example:
-    python scripts/run_pipeline.py --metadata data/test_batch_100.tsv --threads 8
+Example (tldr-based):
+    python scripts/run_pipeline.py --metadata batch.tsv --steps tldr circle --threads 44
+
+Example (Sniffles2-based):
+    python scripts/run_pipeline.py --metadata batch.tsv --steps sniffles circle --threads 44
 """
 
 import argparse
@@ -23,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
 from cycle.download_manager import SRADownloader
-from cycle.preprocess import ReferenceGenomeResolver, Aligner, ISReferenceBuilder, TldrRunner
+from cycle.preprocess import ReferenceGenomeResolver, Aligner, ISReferenceBuilder, TldrRunner, SnifflesRunner
 from cycle.preprocess.config import (
     DEFAULT_ALIGNMENT_DIR,
     DEFAULT_FASTQ_DIR,
@@ -33,6 +37,7 @@ from cycle.preprocess.config import (
     DEFAULT_SORT_MEMORY,
     DEFAULT_THREADS,
     DEFAULT_TLDR_OUTPUT_DIR,
+    DEFAULT_SNIFFLES_OUTPUT_DIR,
 )
 from cycle.circle_detect import CircleFinder
 from cycle.circle_detect.config import (
@@ -42,7 +47,7 @@ from cycle.circle_detect.config import (
 )
 from cycle.utils import find_fastq, slugify
 
-ALL_STEPS = ["download", "resolve", "index", "align", "is_ref", "tldr", "circle"]
+ALL_STEPS = ["download", "resolve", "index", "align", "is_ref", "tldr", "sniffles", "circle"]
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +98,19 @@ def parse_args():
     )
     parser.add_argument(
         "--tldr-procs", type=int, default=8,
-        help="Number of processes for tldr. Default: 8",
+        help="Number of processes per tldr invocation. Default: 8",
+    )
+    parser.add_argument(
+        "--tldr-parallel", type=int, default=1,
+        help="Number of organisms to run tldr on in parallel. Default: 1",
+    )
+    parser.add_argument(
+        "--sniffles-dir", default=None,
+        help=f"Directory for Sniffles2 output. Default: derived from --outdir or {DEFAULT_SNIFFLES_OUTPUT_DIR}",
+    )
+    parser.add_argument(
+        "--sniffles-parallel", type=int, default=1,
+        help="Number of organisms to run Sniffles2 on in parallel. Default: 1",
     )
     parser.add_argument(
         "--preset", default=DEFAULT_MINIMAP2_PRESET,
@@ -138,7 +155,12 @@ def parse_args():
         args.align_dir = str(out / "alignments")
         args.is_dir = str(out / "is_reference")
         args.tldr_dir = str(out / "tldr_output")
+        args.sniffles_dir = str(out / "sniffles_output")
         args.circle_dir = str(out / "circle_output")
+
+    # Set default for sniffles_dir if not provided
+    if args.sniffles_dir is None:
+        args.sniffles_dir = DEFAULT_SNIFFLES_OUTPUT_DIR
 
     return args
 
@@ -371,7 +393,9 @@ def main():
         logger.info("=" * 60)
 
         if not ref_map:
-            ref_map = discover_existing_refs(Path(args.ref_dir))
+            ref_map = discover_organism_refs(
+                Path(args.align_dir), metadata, Path(args.ref_dir),
+            )
 
         is_ref_path = Path(args.is_dir) / "is_reference.fa"
         if not is_ref_path.exists():
@@ -388,10 +412,36 @@ def main():
             ref_map=ref_map,
             is_ref=is_ref_path,
             procs=args.tldr_procs,
+            parallel=args.tldr_parallel,
         )
 
         ok = sum(1 for v in tldr_results.values() if v)
         logger.info(f"tldr: {ok}/{len(tldr_results)} organism groups produced results")
+
+    # ── Stage 6alt: Sniffles2 ────────────────────────────────────────
+    sniffles_results: dict[str, Path | None] = {}
+    if "sniffles" in steps:
+        logger.info("=" * 60)
+        logger.info("STAGE 6alt: sniffles — detecting insertions with Sniffles2")
+        logger.info("=" * 60)
+
+        if not ref_map:
+            ref_map = discover_organism_refs(
+                Path(args.align_dir), metadata, Path(args.ref_dir),
+            )
+
+        runner = SnifflesRunner(
+            output_dir=args.sniffles_dir,
+            alignment_dir=args.align_dir,
+        )
+        sniffles_results = runner.run_batch(
+            metadata=metadata,
+            ref_map=ref_map,
+            parallel=args.sniffles_parallel,
+        )
+
+        ok = sum(1 for v in sniffles_results.values() if v)
+        logger.info(f"Sniffles2: {ok}/{len(sniffles_results)} organism groups produced results")
 
     # ── Stage 7: Circle detection ─────────────────────────────────────
     if "circle" in steps:
@@ -399,14 +449,33 @@ def main():
         logger.info("STAGE 7: circle — detecting IS circular intermediates")
         logger.info("=" * 60)
 
-        # Discover tldr tables if the tldr step was not run in this session
-        if not any(tldr_results.values()):
+        # Discover insertion tables if neither tldr nor sniffles ran in this session
+        insertion_results = {}
+        if any(tldr_results.values()):
+            insertion_results = tldr_results
+            logger.info("Using tldr results for circle detection")
+        elif any(sniffles_results.values()):
+            insertion_results = sniffles_results
+            logger.info("Using Sniffles2 results for circle detection")
+        else:
+            # Try to discover from disk
             tldr_results = discover_tldr_tables(
                 Path(args.tldr_dir), metadata,
             )
+            if any(tldr_results.values()):
+                insertion_results = tldr_results
+                logger.info("Using discovered tldr results for circle detection")
+            else:
+                # Try sniffles directory
+                sniffles_results = discover_tldr_tables(
+                    Path(args.sniffles_dir), metadata,
+                )
+                if any(sniffles_results.values()):
+                    insertion_results = sniffles_results
+                    logger.info("Using discovered Sniffles2 results for circle detection")
 
-        if not any(tldr_results.values()):
-            logger.error("No tldr tables found. Run the tldr step first.")
+        if not any(insertion_results.values()):
+            logger.error("No insertion tables found. Run tldr or sniffles step first.")
             sys.exit(1)
 
         if not ref_map:
@@ -422,7 +491,7 @@ def main():
             sort_memory=args.sort_memory,
         )
         circle_results = finder.run_batch(
-            tldr_results=tldr_results,
+            tldr_results=insertion_results,
             metadata=metadata,
             fastq_dir=args.fastq_dir,
             ref_map=ref_map if ref_map else None,

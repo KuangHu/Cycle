@@ -21,3 +21,6 @@ DEFAULT_FASTQ_DIR = "data/sra_downloads"
 
 # ── tldr output ──────────────────────────────────────────────────
 DEFAULT_TLDR_OUTPUT_DIR = "data/tldr_output"
+
+# ── Sniffles2 output ──────────────────────────────────────────────
+DEFAULT_SNIFFLES_OUTPUT_DIR = "data/sniffles_output"

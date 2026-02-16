@@ -106,9 +106,11 @@ class Aligner:
         ref = mmi if mmi.exists() else reference
 
         # minimap2 -a | samtools sort → BAM (pipe-based, no intermediate SAM)
+        # --MD flag is required for Sniffles2 to parse alignments correctly
         mm2_cmd = [
             "minimap2",
             "-a",
+            "--MD",
             "-x", self.preset,
             "-t", str(self.threads),
             str(ref),
