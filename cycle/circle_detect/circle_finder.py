@@ -135,11 +135,15 @@ class CircleFinder:
 
         contig_length = fa.get_reference_length(entry.chrom)
 
-        up_start = max(0, entry.start - self.flank_length)
-        down_end = min(contig_length, entry.end + self.flank_length)
+        # Ensure valid coordinates (some SVs can have end < start)
+        start = min(entry.start, entry.end)
+        end = max(entry.start, entry.end)
 
-        upstream = fa.fetch(entry.chrom, up_start, entry.start)
-        downstream = fa.fetch(entry.chrom, entry.end, down_end)
+        up_start = max(0, start - self.flank_length)
+        down_end = min(contig_length, end + self.flank_length)
+
+        upstream = fa.fetch(entry.chrom, up_start, start)
+        downstream = fa.fetch(entry.chrom, end, down_end)
 
         if len(upstream) < self.min_overlap or len(downstream) < self.min_overlap:
             logger.debug(
