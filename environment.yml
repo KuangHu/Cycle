@@ -16,6 +16,7 @@ dependencies:
   - mafft>=7.505
   - exonerate>=2.4
   - kingfisher>=0.4.1
+  - sniffles>=2.0
   # NCBI datasets CLI
   - ncbi-datasets-cli>=18.0
   # tldr installed via pip (not on conda)

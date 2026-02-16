@@ -113,8 +113,7 @@ def main():
 
         # Build pipeline command
         pipeline_cmd = (
-            f"source activate {args.conda_env} && "
-            f"python {pipeline}"
+            f"conda run -n {args.conda_env} python {pipeline}"
             f" --metadata {batch_tsv}"
             f" --outdir {outdir}"
             f" --threads {args.threads}"
@@ -133,7 +132,7 @@ def main():
             f" --time={args.time}"
             f" --output={log_file}"
             f" --error={log_file}"
-            f" --wrap '{pipeline_cmd}'"
+            f' --wrap "{pipeline_cmd}"'
         )
         lines.append(sbatch_cmd)
 

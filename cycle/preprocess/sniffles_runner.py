@@ -90,6 +90,7 @@ class SnifflesRunner:
             else:
                 # Run Sniffles2 with sensitive settings
                 # --no-qc disables quality filters for maximum sensitivity
+                # --allow-overwrite permits reprocessing samples if needed
                 cmd = [
                     "sniffles",
                     "--input", str(bam),
@@ -98,11 +99,12 @@ class SnifflesRunner:
                     "--threads", "1",  # Process one at a time
                     "--minsvlen", str(min_size),
                     "--minsupport", str(min_support),
+                    "--allow-overwrite",
                 ]
                 if disable_qc:
                     cmd.append("--no-qc")
 
-                logger.debug(f"  [{i}/{len(bams)}] {bam_name}")
+                logger.debug(f"  [{i}/{len(bams)}] Running Sniffles2 for {bam_name}")
 
                 try:
                     ret = subprocess.run(
@@ -110,7 +112,9 @@ class SnifflesRunner:
                         cwd=str(org_dir),
                     )
                     if ret.returncode != 0:
-                        logger.warning(f"Sniffles2 failed for {bam_name}: {ret.stderr.strip()[:200]}")
+                        err_msg = ret.stderr.strip() or ret.stdout.strip() or "(no output)"
+                        logger.warning(f"Sniffles2 failed for {bam_name} (exit={ret.returncode}): {err_msg[:300]}")
+                        logger.debug(f"  Command: {' '.join(cmd)}")
                         continue
                 except subprocess.TimeoutExpired:
                     logger.warning(f"Sniffles2 timed out for {bam_name}")
