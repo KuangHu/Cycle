@@ -70,8 +70,14 @@ class SnifflesRunner:
         vcf_path = Path(f"{output_prefix}.vcf")
 
         if table_path.exists():
-            logger.info(f"Sniffles2 output exists for {organism}: {table_path}")
-            return table_path
+            # Only skip if table has actual data (not just the header line)
+            with open(table_path) as f:
+                line_count = sum(1 for _ in f)
+            if line_count > 1:
+                logger.info(f"Sniffles2 output exists for {organism} ({line_count - 1} insertions): {table_path}")
+                return table_path
+            else:
+                logger.info(f"Reprocessing {organism} — table exists but has no insertions")
 
         # Run Sniffles2 on each BAM separately and combine results
         # Sniffles2 v2.7.2 only accepts one BAM at a time for calling
