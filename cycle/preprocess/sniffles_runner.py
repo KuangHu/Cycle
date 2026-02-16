@@ -45,6 +45,7 @@ class SnifflesRunner:
         max_size: int = 20000,  # Upper limit to include larger IS elements and composite transposons
         min_support: int = 1,  # Detect rare transposition events with 1 read
         disable_qc: bool = True,  # Disable QC filters for max sensitivity
+        merge_mode: bool = True,  # Run on each BAM separately and merge results
     ) -> Optional[Path]:
         """Run Sniffles2 on a group of BAMs for one organism.
 
@@ -72,65 +73,69 @@ class SnifflesRunner:
             logger.info(f"Sniffles2 output exists for {organism}: {table_path}")
             return table_path
 
-        # Run Sniffles2 with sensitive settings for detecting rare transpositions
-        # Note: --mosaic flag is NOT used because it's designed for somatic/cancer
-        # variants and filters out bacterial transposon insertions (tested on
-        # A. xylosoxidans: 2 insertions without --mosaic, 0 with --mosaic).
-        # --no-qc disables quality filters for maximum sensitivity (found 235
-        # insertions vs 2 with default QC on A. xylosoxidans test).
-        # Build command - Sniffles2 accepts space-separated BAMs after --input
-        cmd = ["sniffles", "--input"] + [str(b) for b in bams] + [
-            "--vcf", str(vcf_path),
-            "--reference", str(ref_fasta),
-            "--threads", "4",
-            "--minsvlen", str(min_size),
-            "--minsupport", str(min_support),
-        ]
-        if disable_qc:
-            cmd.append("--no-qc")
-
+        # Run Sniffles2 on each BAM separately and combine results
+        # Sniffles2 v2.7.2 only accepts one BAM at a time for calling
         logger.info(
             f"Running Sniffles2 for {organism} ({len(bams)} BAMs): {slug}"
         )
-        logger.debug(f"  cmd: {' '.join(cmd)}")
 
-        try:
-            ret = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=1800,
-                cwd=str(org_dir),
-            )
-        except subprocess.TimeoutExpired:
-            logger.error(f"Sniffles2 timed out for {organism}")
-            return None
+        all_insertions = []
+        for i, bam in enumerate(bams, 1):
+            bam_name = bam.stem.replace('.sorted', '')
+            vcf_individual = org_dir / f"{bam_name}.vcf"
 
-        if ret.returncode != 0:
-            logger.error(
-                f"Sniffles2 failed for {organism} (rc={ret.returncode}): "
-                f"{ret.stderr.strip()[:500]}"
-            )
-            return None
-
-        if not vcf_path.exists():
-            logger.warning(f"Sniffles2 finished but no VCF found at {vcf_path}")
-            return None
-
-        # Parse VCF and create insertion table
-        try:
-            insertions = self._parse_vcf(vcf_path, min_size, max_size, organism)
-            if insertions:
-                self._write_table(insertions, table_path)
-                logger.info(f"  -> {table_path} ({len(insertions)} insertions)")
-                return table_path
+            # Skip if already processed
+            if vcf_individual.exists():
+                logger.debug(f"  [{i}/{len(bams)}] {bam_name} - using existing VCF")
             else:
-                logger.warning(f"No insertions found in {vcf_path}")
-                # Write empty table
-                pd.DataFrame(columns=["UUID", "Chrom", "Start", "End", "Sequence", "Support"]).to_csv(
-                    table_path, sep="\t", index=False
-                )
-                return table_path
-        except Exception as e:
-            logger.error(f"Failed to parse VCF for {organism}: {e}")
-            return None
+                # Run Sniffles2 with sensitive settings
+                # --no-qc disables quality filters for maximum sensitivity
+                cmd = [
+                    "sniffles",
+                    "--input", str(bam),
+                    "--vcf", str(vcf_individual),
+                    "--reference", str(ref_fasta),
+                    "--threads", "1",  # Process one at a time
+                    "--minsvlen", str(min_size),
+                    "--minsupport", str(min_support),
+                ]
+                if disable_qc:
+                    cmd.append("--no-qc")
+
+                logger.debug(f"  [{i}/{len(bams)}] {bam_name}")
+
+                try:
+                    ret = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=600,
+                        cwd=str(org_dir),
+                    )
+                    if ret.returncode != 0:
+                        logger.warning(f"Sniffles2 failed for {bam_name}: {ret.stderr.strip()[:200]}")
+                        continue
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Sniffles2 timed out for {bam_name}")
+                    continue
+
+            # Parse VCF and collect insertions
+            if vcf_individual.exists():
+                try:
+                    insertions = self._parse_vcf(vcf_individual, min_size, max_size, organism)
+                    all_insertions.extend(insertions)
+                except Exception as e:
+                    logger.warning(f"Failed to parse VCF for {bam_name}: {e}")
+
+        # Write combined results
+        if all_insertions:
+            self._write_table(all_insertions, table_path)
+            logger.info(f"  -> {table_path} ({len(all_insertions)} insertions from {len(bams)} samples)")
+            return table_path
+        else:
+            logger.warning(f"No insertions found for {organism}")
+            # Write empty table
+            pd.DataFrame(columns=["UUID", "Chrom", "Start", "End", "Consensus", "Support"]).to_csv(
+                table_path, sep="\t", index=False
+            )
+            return table_path
 
     def _parse_vcf(
         self, vcf_path: Path, min_size: int, max_size: int, organism: str
