@@ -135,9 +135,12 @@ class CircleFinder:
 
         contig_length = fa.get_reference_length(entry.chrom)
 
-        # Ensure valid coordinates (some SVs can have end < start)
+        # Ensure valid coordinates (some SVs can have end < start or
+        # coordinates beyond contig length)
         start = min(entry.start, entry.end)
         end = max(entry.start, entry.end)
+        start = max(0, min(start, contig_length))
+        end = max(0, min(end, contig_length))
 
         up_start = max(0, start - self.flank_length)
         down_end = min(contig_length, end + self.flank_length)
