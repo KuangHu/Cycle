@@ -611,13 +611,19 @@ class CircleFinder:
                 if ref_info:
                     ref_fasta = ref_info.get("fasta")
 
-            out = self.run_organism(
-                tldr_table=table_path,
-                fastqs=fastqs,
-                organism=organism,
-                ref_fasta=ref_fasta,
-            )
-            results[organism] = out
+            try:
+                out = self.run_organism(
+                    tldr_table=table_path,
+                    fastqs=fastqs,
+                    organism=organism,
+                    ref_fasta=ref_fasta,
+                )
+                results[organism] = out
+            except Exception as exc:
+                logger.error(
+                    f"Circle detection failed for {organism}, skipping: {exc}"
+                )
+                results[organism] = None
 
         ok = sum(1 for v in results.values() if v)
         logger.info(
