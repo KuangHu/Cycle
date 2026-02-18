@@ -15,6 +15,7 @@ import csv
 import logging
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -558,6 +559,7 @@ class CircleFinder:
         organism_col: str = "organism",
         accession_col: str = "srr_accession",
         ref_map: dict[str, dict] | None = None,
+        parallel: int = 1,
     ) -> dict[str, Optional[Path]]:
         """Run circle detection for all organism groups.
 
@@ -570,6 +572,7 @@ class CircleFinder:
             ref_map: Optional organism -> reference info dict.  When provided,
                 insertion-context baits are built for genome-head and
                 tail-genome junction detection.
+            parallel: Number of organisms to process in parallel.
 
         Returns:
             Dict mapping organism -> circle output directory (or None).
@@ -580,6 +583,8 @@ class CircleFinder:
 
         logger.info(f"Running circle detection for {len(groups)} organism groups")
 
+        # Collect tasks
+        tasks: list[tuple[str, list[tuple[str, Path]], Path, Path | None]] = []
         for organism, group_df in groups:
             table_path = tldr_results.get(organism)
             if not table_path:
@@ -611,19 +616,57 @@ class CircleFinder:
                 if ref_info:
                     ref_fasta = ref_info.get("fasta")
 
-            try:
-                out = self.run_organism(
-                    tldr_table=table_path,
-                    fastqs=fastqs,
-                    organism=organism,
-                    ref_fasta=ref_fasta,
-                )
-                results[organism] = out
-            except Exception as exc:
-                logger.error(
-                    f"Circle detection failed for {organism}, skipping: {exc}"
-                )
-                results[organism] = None
+            tasks.append((organism, fastqs, table_path, ref_fasta))
+
+        if parallel <= 1:
+            # Sequential
+            for organism, fastqs, table_path, ref_fasta in tasks:
+                try:
+                    out = self.run_organism(
+                        tldr_table=table_path,
+                        fastqs=fastqs,
+                        organism=organism,
+                        ref_fasta=ref_fasta,
+                    )
+                    results[organism] = out
+                except Exception as exc:
+                    logger.error(
+                        f"Circle detection failed for {organism}, skipping: {exc}"
+                    )
+                    results[organism] = None
+        else:
+            # Parallel execution
+            logger.info(f"Running {len(tasks)} organisms with {parallel} in parallel")
+            with ProcessPoolExecutor(max_workers=parallel) as pool:
+                futures = {}
+                for organism, fastqs, table_path, ref_fasta in tasks:
+                    fut = pool.submit(
+                        _run_circle_worker,
+                        organism=organism,
+                        fastqs=fastqs,
+                        table_path=table_path,
+                        ref_fasta=ref_fasta,
+                        output_dir=self.output_dir,
+                        threads=self.threads,
+                        sort_memory=self.sort_memory,
+                        min_overlap=self.min_overlap,
+                        min_consensus_length=self.min_consensus_length,
+                        flank_length=self.flank_length,
+                    )
+                    futures[fut] = organism
+
+                for fut in as_completed(futures):
+                    organism = futures[fut]
+                    try:
+                        out = fut.result()
+                        results[organism] = out
+                        if out:
+                            logger.info(f"  -> {out}")
+                    except Exception as exc:
+                        logger.error(
+                            f"Circle detection worker failed for {organism}: {exc}"
+                        )
+                        results[organism] = None
 
         ok = sum(1 for v in results.values() if v)
         logger.info(
@@ -631,6 +674,35 @@ class CircleFinder:
             f"processed"
         )
         return results
+
+
+def _run_circle_worker(
+    organism: str,
+    fastqs: list[tuple[str, Path]],
+    table_path: Path,
+    ref_fasta: Path | None,
+    output_dir: Path,
+    threads: int,
+    sort_memory: str,
+    min_overlap: int,
+    min_consensus_length: int,
+    flank_length: int,
+) -> Optional[Path]:
+    """Standalone worker function for parallel circle detection."""
+    finder = CircleFinder(
+        output_dir=str(output_dir),
+        threads=threads,
+        sort_memory=sort_memory,
+        min_overlap=min_overlap,
+        min_consensus_length=min_consensus_length,
+        flank_length=flank_length,
+    )
+    return finder.run_organism(
+        tldr_table=table_path,
+        fastqs=fastqs,
+        organism=organism,
+        ref_fasta=ref_fasta,
+    )
 
 
 def _write_tsv(path: Path, rows: list[dict], columns: list[str]) -> None:

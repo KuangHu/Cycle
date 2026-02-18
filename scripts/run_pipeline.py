@@ -113,6 +113,10 @@ def parse_args():
         help="Number of organisms to run Sniffles2 on in parallel. Default: 1",
     )
     parser.add_argument(
+        "--circle-parallel", type=int, default=1,
+        help="Number of organisms to run circle detection on in parallel. Default: 1",
+    )
+    parser.add_argument(
         "--preset", default=DEFAULT_MINIMAP2_PRESET,
         help=f"minimap2 preset. Default: {DEFAULT_MINIMAP2_PRESET}",
     )
@@ -495,6 +499,7 @@ def main():
             metadata=metadata,
             fastq_dir=args.fastq_dir,
             ref_map=ref_map if ref_map else None,
+            parallel=args.circle_parallel,
         )
 
         ok = sum(1 for v in circle_results.values() if v)
