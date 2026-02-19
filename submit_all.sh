@@ -9,27 +9,31 @@
 # Note: partition is EXCLUSIVE (whole node per job), so all steps request full node.
 #
 # Examples:
-#   bash submit_all.sh --step 1 5 94       # Download+resolve+index batches 005-094
-#   bash submit_all.sh --step 2 5 94       # Align batches 005-094
-#   bash submit_all.sh --step 3 5 94       # Sniffles+circle batches 005-094
+#   bash submit_all.sh --step 1 5 94             # Download+resolve+index batches 005-094
+#   bash submit_all.sh --step 2 --dep 1 5 94     # Align after step 1 finishes
+#   bash submit_all.sh --step 3 --dep 2 5 94     # Sniffles+circle after step 2 finishes
 
 set -e
 
 # Parse arguments
 STEP=""
+DEP_STEP=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --step) STEP="$2"; shift 2 ;;
+        --dep)  DEP_STEP="$2"; shift 2 ;;
         *) break ;;
     esac
 done
 
 if [ -z "$STEP" ] || ! [[ "$STEP" =~ ^[123]$ ]]; then
-    echo "Usage: bash submit_all.sh --step {1|2|3} [start] [end]"
+    echo "Usage: bash submit_all.sh --step {1|2|3} [--dep {1|2|3}] [start] [end]"
     echo ""
     echo "  Step 1: Download + Resolve + Index  (48 CPUs, 192G)"
     echo "  Step 2: Align                       (48 CPUs, 192G)"
     echo "  Step 3: Sniffles + Circle           (48 CPUs, 192G)"
+    echo ""
+    echo "  --dep N: wait for step N to finish (uses SLURM afterok dependency)"
     exit 1
 fi
 
@@ -53,6 +57,7 @@ esac
 
 echo "=========================================="
 echo "Step: $STEP  (CPUs=$CPUS, Mem=$MEM)"
+[ -n "$DEP_STEP" ] && echo "Dependency: afterok step $DEP_STEP"
 echo "Batches: $(printf '%03d' $START) to $(printf '%03d' $END)"
 echo "=========================================="
 echo ""
@@ -63,6 +68,18 @@ for i in $(seq $START $END); do
     metadata="$BATCHDIR/${batch_name}.tsv"
     batch_dir="$OUTROOT/$batch_name"
 
+    # Resolve dependency job ID for this batch
+    DEP_FLAG=""
+    if [ -n "$DEP_STEP" ]; then
+        dep_jobid=$(squeue -u "$(whoami)" -n "${batch_name}_s${DEP_STEP}" -h -o "%i" 2>/dev/null | head -1)
+        if [ -n "$dep_jobid" ]; then
+            DEP_FLAG="--dependency=afterok:${dep_jobid}"
+            echo "  $batch_name: depends on job $dep_jobid (step $DEP_STEP)"
+        else
+            echo "  $batch_name: no running step $DEP_STEP job found, submitting immediately"
+        fi
+    fi
+
     # Step 1: need metadata file
     if [ "$STEP" = "1" ]; then
         if [ ! -f "$metadata" ]; then
@@ -71,16 +88,16 @@ for i in $(seq $START $END); do
         fi
     fi
 
-    # Step 2: need downloaded FASTQs
-    if [ "$STEP" = "2" ]; then
+    # Step 2: need downloaded FASTQs (skip check if dependency set)
+    if [ "$STEP" = "2" ] && [ -z "$DEP_FLAG" ]; then
         if [ ! -d "$batch_dir/sra_downloads" ]; then
             echo "  SKIP $batch_name — no sra_downloads/ (run step 1 first)"
             continue
         fi
     fi
 
-    # Step 3: need alignments
-    if [ "$STEP" = "3" ]; then
+    # Step 3: need alignments (skip check if dependency set)
+    if [ "$STEP" = "3" ] && [ -z "$DEP_FLAG" ]; then
         if [ ! -d "$batch_dir/alignments" ]; then
             echo "  SKIP $batch_name — no alignments/ (run step 2 first)"
             continue
@@ -141,6 +158,7 @@ python $PIPELINE \
         --time=$TIME \
         --output="$LOGDIR/${batch_name}_step${STEP}_%j.out" \
         --error="$LOGDIR/${batch_name}_step${STEP}_%j.err" \
+        $DEP_FLAG \
         --wrap="$CMD")
 
     echo "  $batch_name: Job $jobid"

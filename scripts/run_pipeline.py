@@ -169,6 +169,28 @@ def parse_args():
     return args
 
 
+def discover_resolve_status(ref_dir: Path) -> dict[str, dict]:
+    """Read organism-keyed ref_map from resolve_status.tsv saved by the resolve stage."""
+    ref_map: dict[str, dict] = {}
+    status_file = ref_dir / "resolve_status.tsv"
+    if not status_file.exists():
+        return ref_map
+
+    status = pd.read_csv(status_file, sep="\t")
+    for _, row in status.iterrows():
+        fasta = Path(row["fasta"])
+        if fasta.exists():
+            fai = fasta.with_suffix(".fna.fai")
+            ref_map[row["organism"]] = {
+                "accession": row["accession"],
+                "fasta": fasta,
+                "fai": fai if fai.exists() else None,
+            }
+
+    logger.info(f"Discovered {len(ref_map)} organism-keyed references from {status_file}")
+    return ref_map
+
+
 def discover_existing_refs(ref_dir: Path) -> dict[str, dict]:
     """Build ref_map from already-downloaded genomes on disk (accession-keyed)."""
     ref_map: dict[str, dict] = {}
@@ -302,6 +324,20 @@ def main():
         )
         ref_map = resolver.resolve_all(metadata)
 
+        # Save organism -> reference mapping for use by later steps in separate jobs
+        status_path = Path(args.ref_dir) / "resolve_status.tsv"
+        rows = []
+        for org, info in ref_map.items():
+            if info:
+                rows.append({
+                    "organism": org,
+                    "accession": info["accession"],
+                    "fasta": str(info["fasta"]),
+                })
+        if rows:
+            pd.DataFrame(rows).to_csv(status_path, sep="\t", index=False)
+            logger.info(f"Resolve status saved to {status_path}")
+
     # ── Stage 3: Build minimap2 indices ──────────────────────────────
     if "index" in steps:
         logger.info("=" * 60)
@@ -315,6 +351,8 @@ def main():
             sort_memory=args.sort_memory,
         )
 
+        if not ref_map:
+            ref_map = discover_resolve_status(Path(args.ref_dir))
         if not ref_map:
             ref_map = discover_existing_refs(Path(args.ref_dir))
 
@@ -335,6 +373,8 @@ def main():
             sort_memory=args.sort_memory,
         )
 
+        if not ref_map:
+            ref_map = discover_resolve_status(Path(args.ref_dir))
         if not ref_map:
             ref_map = discover_existing_refs(Path(args.ref_dir))
 
