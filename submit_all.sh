@@ -4,7 +4,7 @@
 # Usage:
 #   bash submit_all.sh --step 1 [start] [end]    # Download + Resolve + Index
 #   bash submit_all.sh --step 2 [start] [end]    # Align
-#   bash submit_all.sh --step 3 [start] [end]    # Sniffles + Circle
+#   bash submit_all.sh --step 3 [start] [end]    # Sniffles + Circle + Format
 #
 # Note: partition is EXCLUSIVE (whole node per job), so all steps request full node.
 #
@@ -31,7 +31,7 @@ if [ -z "$STEP" ] || ! [[ "$STEP" =~ ^[123]$ ]]; then
     echo ""
     echo "  Step 1: Download + Resolve + Index  (48 CPUs, 192G)"
     echo "  Step 2: Align                       (48 CPUs, 192G)"
-    echo "  Step 3: Sniffles + Circle           (48 CPUs, 192G)"
+    echo "  Step 3: Sniffles + Circle + Format  (48 CPUs, 192G)"
     echo ""
     echo "  --dep N: wait for step N to finish (uses SLURM afterok dependency)"
     exit 1
@@ -130,7 +130,7 @@ python $PIPELINE \
 
     if [ "$STEP" = "3" ]; then
         CMD="$CMD && \
-echo '=== Step 3: Sniffles + Circle ===' && \
+echo '=== Step 3: Sniffles + Circle + Format ===' && \
 python $PREPARE_META '$batch_dir' && \
 python $PIPELINE \
   --metadata '$batch_dir/metadata_for_sniffles.tsv' \
@@ -143,6 +143,12 @@ python $PIPELINE \
   --outdir '$batch_dir' \
   --steps circle \
   --circle-parallel 6 \
+  --threads 8 && \
+python $PIPELINE \
+  --metadata '$batch_dir/metadata_for_sniffles.tsv' \
+  --outdir '$batch_dir' \
+  --steps format \
+  --formatter-parallel 6 \
   --threads 8"
     fi
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""End-to-end pipeline: metadata TSV -> circle detection.
+"""End-to-end pipeline: metadata TSV -> IS element extraction.
 
-Chains up to 8 stages:
+Chains up to 9 stages:
   1. download  — fetch FASTQs via kingfisher
   2. resolve   — download one reference genome per organism via NCBI datasets
   3. index     — build minimap2 .mmi indices
@@ -10,6 +10,7 @@ Chains up to 8 stages:
   6. tldr      — run tldr per organism group (IS detection via reference library)
   6alt. sniffles — run Sniffles2 per organism (SV-based insertion detection, faster)
   7. circle    — detect IS circular intermediates via concatemer bait
+  8. format    — extract IS elements + flanking regions via local assembly
 
 Example (tldr-based):
     python scripts/run_pipeline.py --metadata batch.tsv --steps tldr circle --threads 44
@@ -45,9 +46,14 @@ from cycle.circle_detect.config import (
     DEFAULT_FLANK_LENGTH,
     DEFAULT_MIN_JUNCTION_OVERLAP,
 )
+from cycle.is_formatter import ISFormatter
+from cycle.is_formatter.config import (
+    DEFAULT_FLANK_SIZE,
+    DEFAULT_FORMATTER_OUTPUT_DIR,
+)
 from cycle.utils import find_fastq, slugify
 
-ALL_STEPS = ["download", "resolve", "index", "align", "is_ref", "tldr", "sniffles", "circle"]
+ALL_STEPS = ["download", "resolve", "index", "align", "is_ref", "tldr", "sniffles", "circle", "format"]
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +154,18 @@ def parse_args():
         "--flank-length", type=int, default=DEFAULT_FLANK_LENGTH,
         help=f"Genomic flank length (bp) for insertion-context baits. Default: {DEFAULT_FLANK_LENGTH}",
     )
+    parser.add_argument(
+        "--formatter-dir", default=None,
+        help=f"Directory for IS formatter output. Default: derived from --outdir or {DEFAULT_FORMATTER_OUTPUT_DIR}",
+    )
+    parser.add_argument(
+        "--formatter-parallel", type=int, default=1,
+        help="Number of organisms to run IS formatting on in parallel. Default: 1",
+    )
+    parser.add_argument(
+        "--formatter-flank-size", type=int, default=DEFAULT_FLANK_SIZE,
+        help=f"Flanking region size (bp) for IS extraction. Default: {DEFAULT_FLANK_SIZE}",
+    )
 
     args = parser.parse_args()
 
@@ -161,10 +179,15 @@ def parse_args():
         args.tldr_dir = str(out / "tldr_output")
         args.sniffles_dir = str(out / "sniffles_output")
         args.circle_dir = str(out / "circle_output")
+        args.formatter_dir = str(out / "is_formatter_output")
 
     # Set default for sniffles_dir if not provided
     if args.sniffles_dir is None:
         args.sniffles_dir = DEFAULT_SNIFFLES_OUTPUT_DIR
+
+    # Set default for formatter_dir if not provided
+    if args.formatter_dir is None:
+        args.formatter_dir = DEFAULT_FORMATTER_OUTPUT_DIR
 
     return args
 
@@ -292,6 +315,7 @@ def main():
     fastq_dir = Path(args.fastq_dir)
     steps = set(args.steps)
     tldr_results: dict[str, Path | None] = {}
+    circle_results: dict[str, Path | None] = {}
 
     # ── Stage 1: Download FASTQs ─────────────────────────────────────
     if "download" in steps:
@@ -545,6 +569,55 @@ def main():
         ok = sum(1 for v in circle_results.values() if v)
         logger.info(
             f"Circle detection: {ok}/{len(circle_results)} organism groups processed"
+        )
+
+    # ── Stage 8: IS formatting ────────────────────────────────────────
+    if "format" in steps:
+        logger.info("=" * 60)
+        logger.info("STAGE 8: format — extracting IS elements + flanking regions")
+        logger.info("=" * 60)
+
+        # Discover circle results if not available from current session
+        circle_dir = Path(args.circle_dir)
+        if not any(circle_results.values()):
+            # Discover circle output directories from disk
+            circle_results = {}
+            if circle_dir.exists():
+                organisms = metadata["organism"].unique()
+                for org in organisms:
+                    slug_name = slugify(org)
+                    org_circle_dir = circle_dir / slug_name
+                    summary = org_circle_dir / f"{slug_name}_circle_summary.tsv"
+                    if summary.exists():
+                        circle_results[org] = org_circle_dir
+                    else:
+                        circle_results[org] = None
+                found = sum(1 for v in circle_results.values() if v)
+                logger.info(
+                    f"Discovered {found}/{len(circle_results)} circle output "
+                    f"directories in {circle_dir}"
+                )
+
+        if not any(circle_results.values()):
+            logger.error(
+                "No circle detection output found. Run circle step first."
+            )
+            sys.exit(1)
+
+        formatter = ISFormatter(
+            output_dir=args.formatter_dir,
+            flank_size=args.formatter_flank_size,
+            threads=args.threads,
+        )
+        format_results = formatter.run_batch(
+            circle_results=circle_results,
+            metadata=metadata,
+            parallel=args.formatter_parallel,
+        )
+
+        ok = sum(1 for v in format_results.values() if v)
+        logger.info(
+            f"IS formatting: {ok}/{len(format_results)} organism groups processed"
         )
 
     logger.info("Pipeline complete.")
