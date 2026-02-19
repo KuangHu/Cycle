@@ -10,9 +10,11 @@ Output: JSON (ISExtractor-compatible) and TSV per organism.
 import csv
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -24,6 +26,7 @@ from .config import (
     DEFAULT_ASSEMBLY_TIMEOUT,
     DEFAULT_FLANK_SIZE,
     DEFAULT_FORMATTER_OUTPUT_DIR,
+    DEFAULT_MIN_ENTROPY,
     DEFAULT_MIN_READS_FOR_ASSEMBLY,
 )
 
@@ -44,6 +47,7 @@ class ISFormatter:
         flank_size: int = DEFAULT_FLANK_SIZE,
         min_reads: int = DEFAULT_MIN_READS_FOR_ASSEMBLY,
         assembly_timeout: int = DEFAULT_ASSEMBLY_TIMEOUT,
+        min_entropy: float = DEFAULT_MIN_ENTROPY,
         threads: int = 4,
     ):
         self.output_dir = Path(output_dir)
@@ -51,6 +55,7 @@ class ISFormatter:
         self.flank_size = flank_size
         self.min_reads = min_reads
         self.assembly_timeout = assembly_timeout
+        self.min_entropy = min_entropy
         self.threads = threads
 
         for tool in ("minimap2", "miniasm"):
@@ -68,15 +73,39 @@ class ISFormatter:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _seq_entropy(seq: str) -> float:
+        """Shannon entropy in bits per base (0 = homopolymer, 2 = random)."""
+        if not seq:
+            return 0.0
+        seq = seq.upper()
+        n = len(seq)
+        counts = Counter(seq)
+        return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
     def _load_circle_summary(self, summary_tsv: Path) -> list[dict]:
-        """Load circle summary TSV and return IS entries with any reads."""
+        """Load circle summary TSV and return IS entries with good consensus.
+
+        Filters out entries with no mapped reads or low-complexity consensus
+        (entropy below ``min_entropy``).
+        """
         entries: list[dict] = []
+        skipped_no_reads = 0
+        skipped_low_complexity = 0
+
         with open(summary_tsv) as fh:
             reader = csv.DictReader(fh, delimiter="\t")
             for row in reader:
                 n_total = int(row.get("n_total_mapped", 0))
                 if n_total == 0:
+                    skipped_no_reads += 1
                     continue
+
+                consensus = row.get("consensus", "")
+                if not consensus or self._seq_entropy(consensus) < self.min_entropy:
+                    skipped_low_complexity += 1
+                    continue
+
                 entries.append({
                     "is_uuid": row["is_uuid"],
                     "chrom": row["chrom"],
@@ -85,15 +114,18 @@ class ISFormatter:
                     "family": row.get("family", "NA"),
                     "subfamily": row.get("subfamily", "NA"),
                     "consensus_length": int(row.get("consensus_length", 0)),
-                    "consensus": row.get("consensus", ""),
+                    "consensus": consensus,
                     "n_tail_head_reads": int(row.get("n_tail_head_reads", 0)),
                     "n_genome_head_reads": int(row.get("n_genome_head_reads", 0)),
                     "n_tail_genome_reads": int(row.get("n_tail_genome_reads", 0)),
                     "n_total_mapped": n_total,
                 })
+
+        total_rows = entries.__len__() + skipped_no_reads + skipped_low_complexity
         logger.info(
-            f"Loaded {len(entries)} IS elements with reads from "
-            f"{summary_tsv.name}"
+            f"Loaded {len(entries)}/{total_rows} IS elements from "
+            f"{summary_tsv.name} (skipped {skipped_no_reads} no-reads, "
+            f"{skipped_low_complexity} low-complexity)"
         )
         return entries
 
@@ -653,6 +685,7 @@ class ISFormatter:
                         flank_size=self.flank_size,
                         min_reads=self.min_reads,
                         assembly_timeout=self.assembly_timeout,
+                        min_entropy=self.min_entropy,
                         threads=self.threads,
                     )
                     futures[fut] = organism
@@ -689,6 +722,7 @@ def _run_formatter_worker(
     flank_size: int,
     min_reads: int,
     assembly_timeout: int,
+    min_entropy: float,
     threads: int,
 ) -> Optional[Path]:
     """Standalone worker function for parallel IS formatting."""
@@ -697,6 +731,7 @@ def _run_formatter_worker(
         flank_size=flank_size,
         min_reads=min_reads,
         assembly_timeout=assembly_timeout,
+        min_entropy=min_entropy,
         threads=threads,
     )
     return formatter.run_organism(
