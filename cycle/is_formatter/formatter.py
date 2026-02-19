@@ -97,16 +97,21 @@ class ISFormatter:
         )
         return entries
 
-    def _extract_reads_for_is(
-        self, bam_paths: list[Path], is_uuid: str,
-    ) -> list[tuple[str, str, str]]:
-        """Extract reads mapped to any bait containing *is_uuid*.
+    def _extract_all_reads(
+        self, bam_paths: list[Path], uuids: set[str],
+    ) -> dict[str, list[tuple[str, str, str]]]:
+        """Scan all BAMs once and group reads by IS UUID.
 
-        Returns list of (read_id, sequence, quality_string) tuples,
-        deduplicated by read name.
+        Each BAM is read in a single pass.  Reads are assigned to a UUID
+        by parsing the bait reference name (``{uuid}__...``).  Reads are
+        deduplicated by (uuid, read_name).
+
+        Returns dict mapping uuid -> list of (read_id, sequence, qual_str).
         """
-        seen: set[str] = set()
-        reads: list[tuple[str, str, str]] = []
+        reads_by_uuid: dict[str, list[tuple[str, str, str]]] = {
+            u: [] for u in uuids
+        }
+        seen: dict[str, set[str]] = {u: set() for u in uuids}
 
         for bam_path in bam_paths:
             try:
@@ -120,31 +125,39 @@ class ISFormatter:
                     continue
 
                 ref_name = read.reference_name or ""
-                # Bait headers contain the uuid before the __ separator
-                if not ref_name.startswith(is_uuid + "__"):
+                # Bait headers: {uuid}__{type}__...
+                sep = ref_name.find("__")
+                if sep == -1:
+                    continue
+                uuid = ref_name[:sep]
+                if uuid not in uuids:
                     continue
 
                 seq = read.query_sequence
-                qual = read.query_qualities
                 if not seq:
                     continue
 
                 name = read.query_name
-                if name in seen:
+                if name in seen[uuid]:
                     continue
-                seen.add(name)
+                seen[uuid].add(name)
 
-                # Convert quality array to FASTQ quality string
+                qual = read.query_qualities
                 if qual is not None:
                     qual_str = "".join(chr(q + 33) for q in qual)
                 else:
                     qual_str = "I" * len(seq)  # default Q40
 
-                reads.append((name, seq, qual_str))
+                reads_by_uuid[uuid].append((name, seq, qual_str))
 
             bam.close()
 
-        return reads
+        total = sum(len(v) for v in reads_by_uuid.values())
+        logger.info(
+            f"Extracted {total} reads across {len(uuids)} IS elements "
+            f"from {len(bam_paths)} BAM(s)"
+        )
+        return reads_by_uuid
 
     def _assemble_reads(
         self, fastq_path: Path, work_dir: Path,
@@ -477,7 +490,11 @@ class ISFormatter:
         assembly_dir = org_out / "assembly"
         assembly_dir.mkdir(parents=True, exist_ok=True)
 
-        # 4. Process each IS element
+        # 4. Extract all reads from BAMs in a single pass, grouped by UUID
+        all_uuids = {e["is_uuid"] for e in is_entries if e.get("consensus")}
+        reads_by_uuid = self._extract_all_reads(bam_paths, all_uuids)
+
+        # 5. Process each IS element
         records: list[dict] = []
         for is_info in is_entries:
             uuid = is_info["is_uuid"]
@@ -492,9 +509,8 @@ class ISFormatter:
             is_work = assembly_dir / uuid_prefix
             is_work.mkdir(parents=True, exist_ok=True)
 
-            # Extract reads for this IS
-            reads = self._extract_reads_for_is(bam_paths, uuid)
-            logger.debug(f"  {uuid_prefix}: {len(reads)} reads extracted")
+            # Look up pre-extracted reads for this IS
+            reads = reads_by_uuid.get(uuid, [])
 
             is_seq = ""
             upstream = ""
@@ -548,7 +564,7 @@ class ISFormatter:
             )
             records.append(record)
 
-        # 5. Write outputs
+        # 6. Write outputs
         if not records:
             logger.warning(f"No IS records produced for {organism}")
             return None
