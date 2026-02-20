@@ -13,8 +13,10 @@ mapped only once.
 
 import csv
 import logging
+import math
 import shutil
 import subprocess
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +28,7 @@ from ..utils import find_fastq, slugify
 from .config import (
     DEFAULT_CIRCLE_OUTPUT_DIR,
     DEFAULT_FLANK_LENGTH,
+    DEFAULT_MIN_CONSENSUS_ENTROPY,
     DEFAULT_MIN_CONSENSUS_LENGTH,
     DEFAULT_MIN_JUNCTION_OVERLAP,
 )
@@ -62,6 +65,7 @@ class CircleFinder:
         min_overlap: int = DEFAULT_MIN_JUNCTION_OVERLAP,
         min_consensus_length: int = DEFAULT_MIN_CONSENSUS_LENGTH,
         flank_length: int = DEFAULT_FLANK_LENGTH,
+        min_consensus_entropy: float = DEFAULT_MIN_CONSENSUS_ENTROPY,
         threads: int = 8,
         sort_memory: str = "4G",
     ):
@@ -70,6 +74,7 @@ class CircleFinder:
         self.min_overlap = min_overlap
         self.min_consensus_length = min_consensus_length
         self.flank_length = flank_length
+        self.min_consensus_entropy = min_consensus_entropy
         self.threads = threads
         self.sort_memory = sort_memory
 
@@ -81,14 +86,26 @@ class CircleFinder:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _seq_entropy(seq: str) -> float:
+        """Shannon entropy in bits per base (0 = homopolymer, 2 = random)."""
+        if not seq:
+            return 0.0
+        seq = seq.upper()
+        n = len(seq)
+        counts = Counter(seq)
+        return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
     def _parse_tldr_table(self, table_path: Path) -> list[ISEntry]:
         """Parse a tldr .table.txt and return IS entries with valid consensus.
 
-        Filters out entries whose consensus is empty, 'NA', or shorter than
-        ``min_consensus_length``.
+        Filters out entries whose consensus is empty, 'NA', shorter than
+        ``min_consensus_length``, or low-complexity (entropy below
+        ``min_consensus_entropy``).
         """
         table_path = Path(table_path)
         entries: list[ISEntry] = []
+        skipped_low_complexity = 0
 
         with open(table_path) as fh:
             reader = csv.DictReader(fh, delimiter="\t")
@@ -97,6 +114,9 @@ class CircleFinder:
                 if not consensus or consensus == "NA":
                     continue
                 if len(consensus) < self.min_consensus_length:
+                    continue
+                if self._seq_entropy(consensus) < self.min_consensus_entropy:
+                    skipped_low_complexity += 1
                     continue
 
                 entries.append(ISEntry(
@@ -112,6 +132,7 @@ class CircleFinder:
         logger.info(
             f"Parsed {len(entries)} IS entries with consensus >= "
             f"{self.min_consensus_length} bp from {table_path.name}"
+            f" (skipped {skipped_low_complexity} low-complexity)"
         )
         return entries
 
@@ -652,6 +673,7 @@ class CircleFinder:
                         min_overlap=self.min_overlap,
                         min_consensus_length=self.min_consensus_length,
                         flank_length=self.flank_length,
+                        min_consensus_entropy=self.min_consensus_entropy,
                     )
                     futures[fut] = organism
 
@@ -687,6 +709,7 @@ def _run_circle_worker(
     min_overlap: int,
     min_consensus_length: int,
     flank_length: int,
+    min_consensus_entropy: float = DEFAULT_MIN_CONSENSUS_ENTROPY,
 ) -> Optional[Path]:
     """Standalone worker function for parallel circle detection."""
     finder = CircleFinder(
@@ -696,6 +719,7 @@ def _run_circle_worker(
         min_overlap=min_overlap,
         min_consensus_length=min_consensus_length,
         flank_length=flank_length,
+        min_consensus_entropy=min_consensus_entropy,
     )
     return finder.run_organism(
         tldr_table=table_path,
