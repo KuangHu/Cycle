@@ -1,23 +1,25 @@
-"""Run Sniffles2 per organism to detect insertions as IS candidates."""
+"""Run Sniffles2 per sample to detect insertions as IS candidates."""
 
 import logging
+import math
 import shutil
 import subprocess
 import uuid
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import pysam
 
-from ..utils import slugify as _slugify
 from .config import DEFAULT_ALIGNMENT_DIR
 
 logger = logging.getLogger(__name__)
 
 
 class SnifflesRunner:
-    """Run Sniffles2 once per organism group to detect insertions.
+    """Run Sniffles2 once per sample to detect insertions.
 
     Sniffles2 is a structural variant caller that can detect insertions
     without requiring a transposon reference library. We use it as a
@@ -36,131 +38,159 @@ class SnifflesRunner:
         if not shutil.which("sniffles"):
             raise RuntimeError("sniffles not found in PATH")
 
-    def run_organism_group(
+    @staticmethod
+    def _seq_entropy(seq: str) -> float:
+        """Shannon entropy in bits per base (0 = homopolymer, 2 = random)."""
+        if not seq:
+            return 0.0
+        seq = seq.upper()
+        n = len(seq)
+        counts = Counter(seq)
+        return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+    def run_sample(
         self,
-        bams: list[Path],
+        bam: Path,
         ref_fasta: Path,
-        organism: str,
-        min_size: int = 500,  # Lower threshold to catch smaller IS elements
-        max_size: int = 20000,  # Upper limit to include larger IS elements and composite transposons
-        min_support: int = 1,  # Detect rare transposition events with 1 read
-        disable_qc: bool = True,  # Disable QC filters for max sensitivity
-        merge_mode: bool = True,  # Run on each BAM separately and merge results
+        sample_id: str,
+        min_size: int = 500,
+        max_size: int = 20000,
+        min_support: int = 3,
+        disable_qc: bool = False,
     ) -> Optional[Path]:
-        """Run Sniffles2 on a group of BAMs for one organism.
+        """Run Sniffles2 on a single BAM for one sample.
 
         Args:
-            bams: Sorted BAM files (all aligned to the same reference).
+            bam: Sorted BAM file.
             ref_fasta: Reference genome FASTA used for alignment.
-            organism: Organism name (used for output directory naming).
-            min_size: Minimum insertion size in bp (IS elements typically 500-3000bp).
-            max_size: Maximum insertion size in bp (includes composite transposons).
+            sample_id: Sample accession (used for output directory naming).
+            min_size: Minimum insertion size in bp.
+            max_size: Maximum insertion size in bp.
             min_support: Minimum number of supporting reads.
             disable_qc: Disable Sniffles2 quality control filters for max sensitivity.
 
         Returns:
             Path to the Sniffles2-derived insertion table, or None on failure.
         """
-        slug = _slugify(organism)
-        org_dir = self.output_dir / slug
-        org_dir.mkdir(parents=True, exist_ok=True)
+        sample_dir = self.output_dir / sample_id
+        sample_dir.mkdir(parents=True, exist_ok=True)
 
-        output_prefix = org_dir / slug
+        output_prefix = sample_dir / sample_id
         table_path = Path(f"{output_prefix}.table.txt")
         vcf_path = Path(f"{output_prefix}.vcf")
 
         if table_path.exists():
-            # Only skip if table has actual data (not just the header line)
             with open(table_path) as f:
                 line_count = sum(1 for _ in f)
             if line_count > 1:
-                logger.info(f"Sniffles2 output exists for {organism} ({line_count - 1} insertions): {table_path}")
+                logger.info(f"Sniffles2 output exists for {sample_id} ({line_count - 1} insertions): {table_path}")
                 return table_path
             else:
-                logger.info(f"Reprocessing {organism} — table exists but has no insertions")
+                logger.info(f"Reprocessing {sample_id} — table exists but has no insertions")
 
-        # Run Sniffles2 on each BAM separately and combine results
-        # Sniffles2 v2.7.2 only accepts one BAM at a time for calling
-        logger.info(
-            f"Running Sniffles2 for {organism} ({len(bams)} BAMs): {slug}"
-        )
+        logger.info(f"Running Sniffles2 for {sample_id}: {bam.name}")
 
-        all_insertions = []
-        for i, bam in enumerate(bams, 1):
-            bam_name = bam.stem.replace('.sorted', '')
-            vcf_individual = org_dir / f"{bam_name}.vcf"
+        # Skip if already processed with actual variants
+        skip_existing = False
+        if vcf_path.exists():
+            with open(vcf_path) as f:
+                variant_count = sum(1 for line in f if not line.startswith('#'))
+            if variant_count > 0:
+                logger.info(f"  {sample_id} - using existing VCF ({variant_count} variants)")
+                skip_existing = True
+            else:
+                logger.info(f"  {sample_id} - reprocessing empty VCF")
 
-            # Skip if already processed with actual variants (not just headers)
-            skip_existing = False
-            if vcf_individual.exists():
-                # Count non-header lines to see if VCF has variants
-                with open(vcf_individual) as f:
-                    variant_count = sum(1 for line in f if not line.startswith('#'))
-                if variant_count > 0:
-                    logger.info(f"  [{i}/{len(bams)}] {bam_name} - using existing VCF ({variant_count} variants)")
-                    skip_existing = True
-                else:
-                    logger.info(f"  [{i}/{len(bams)}] {bam_name} - reprocessing empty VCF")
+        if not skip_existing:
+            cmd = [
+                "sniffles",
+                "--input", str(bam),
+                "--vcf", str(vcf_path),
+                "--reference", str(ref_fasta),
+                "--threads", "1",
+                "--minsvlen", str(min_size),
+                "--minsupport", str(min_support),
+                "--output-rnames",
+                "--allow-overwrite",
+            ]
+            if disable_qc:
+                cmd.append("--no-qc")
 
-            if not skip_existing:
-                # Run Sniffles2 with sensitive settings
-                # --no-qc disables quality filters for maximum sensitivity
-                # --allow-overwrite permits reprocessing samples if needed
-                cmd = [
-                    "sniffles",
-                    "--input", str(bam),
-                    "--vcf", str(vcf_individual),
-                    "--reference", str(ref_fasta),
-                    "--threads", "1",  # Process one at a time
-                    "--minsvlen", str(min_size),
-                    "--minsupport", str(min_support),
-                    "--allow-overwrite",
-                ]
-                if disable_qc:
-                    cmd.append("--no-qc")
+            try:
+                ret = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=600,
+                    cwd=str(sample_dir),
+                )
+                if ret.returncode != 0:
+                    err_msg = ret.stderr.strip() or ret.stdout.strip() or "(no output)"
+                    logger.warning(f"Sniffles2 failed for {sample_id} (exit={ret.returncode}): {err_msg[:300]}")
+                    return None
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Sniffles2 timed out for {sample_id}")
+                return None
 
-                logger.debug(f"  [{i}/{len(bams)}] Running Sniffles2 for {bam_name}")
+        # Parse VCF and collect insertions
+        insertions = []
+        if vcf_path.exists():
+            try:
+                insertions = self._parse_vcf(vcf_path, min_size, max_size, sample_id)
+            except Exception as e:
+                logger.warning(f"Failed to parse VCF for {sample_id}: {e}")
 
-                try:
-                    ret = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=600,
-                        cwd=str(org_dir),
-                    )
-                    if ret.returncode != 0:
-                        err_msg = ret.stderr.strip() or ret.stdout.strip() or "(no output)"
-                        logger.warning(f"Sniffles2 failed for {bam_name} (exit={ret.returncode}): {err_msg[:300]}")
-                        logger.debug(f"  Command: {' '.join(cmd)}")
-                        continue
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"Sniffles2 timed out for {bam_name}")
-                    continue
+        # Assemble consensus for symbolic ALTs with enough support
+        assembly_dir = sample_dir / "assembly"
+        symbolic = [ins for ins in insertions
+                    if not ins["Sequence"] and len(ins.get("Rnames", [])) >= 3]
+        n_assembled = 0
+        for ins in symbolic:
+            work = assembly_dir / ins["UUID"][:8]
+            contig = self._assemble_insertion(
+                bam_path=bam, chrom=ins["Chrom"], pos=ins["Start"],
+                svlen=ins["End"] - ins["Start"],
+                rnames=ins["Rnames"], work_dir=work,
+            )
+            if contig and self._seq_entropy(contig) >= 1.5 and len(contig) >= min_size:
+                ins["Sequence"] = contig
+                n_assembled += 1
+        if symbolic:
+            logger.info(f"  {sample_id}: assembled {n_assembled}/{len(symbolic)} symbolic ALTs")
 
-            # Parse VCF and collect insertions
-            if vcf_individual.exists():
-                try:
-                    insertions = self._parse_vcf(vcf_individual, min_size, max_size, organism)
-                    all_insertions.extend(insertions)
-                except Exception as e:
-                    logger.warning(f"Failed to parse VCF for {bam_name}: {e}")
+        # Remove entries that still have no usable sequence
+        insertions = [ins for ins in insertions if ins["Sequence"]]
 
-        # Write combined results
-        if all_insertions:
-            self._write_table(all_insertions, table_path)
-            logger.info(f"  -> {table_path} ({len(all_insertions)} insertions from {len(bams)} samples)")
+        # Drop Rnames before writing (not needed downstream)
+        for ins in insertions:
+            ins.pop("Rnames", None)
+
+        # Cleanup assembly temp files
+        if assembly_dir.exists():
+            shutil.rmtree(assembly_dir, ignore_errors=True)
+
+        if insertions:
+            self._write_table(insertions, table_path)
+            logger.info(f"  -> {table_path} ({len(insertions)} insertions)")
             return table_path
         else:
-            logger.warning(f"No insertions found for {organism}")
-            # Write empty table
+            logger.warning(f"No insertions found for {sample_id}")
             pd.DataFrame(columns=["UUID", "Chrom", "Start", "End", "Consensus", "Support"]).to_csv(
                 table_path, sep="\t", index=False
             )
             return table_path
 
     def _parse_vcf(
-        self, vcf_path: Path, min_size: int, max_size: int, organism: str
+        self, vcf_path: Path, min_size: int, max_size: int, sample_id: str,
+        min_entropy: float = 1.5,
     ) -> list[dict]:
-        """Parse Sniffles2 VCF and extract insertions."""
+        """Parse Sniffles2 VCF and extract insertions.
+
+        Symbolic ALTs (``<INS>``) get ``Sequence=""`` and supporting read
+        names stored in ``Rnames`` for downstream assembly.  Resolved
+        sequences with Shannon entropy below *min_entropy* are discarded.
+        """
         insertions = []
+        n_symbolic = 0
+        n_low_entropy = 0
+        n_total = 0
 
         with open(vcf_path) as f:
             for line in f:
@@ -177,46 +207,47 @@ class SnifflesRunner:
                 alt = fields[4]
                 info = fields[7]
 
-                # Parse INFO field for SVTYPE and SVLEN
+                # Parse INFO field
                 info_dict = {}
                 for item in info.split(";"):
                     if "=" in item:
                         key, val = item.split("=", 1)
                         info_dict[key] = val
 
-                # Filter for insertions, duplications, and breakends (all relevant for IS detection)
                 svtype = info_dict.get("SVTYPE", "")
                 if svtype not in ("INS", "DUP", "BND"):
                     continue
 
-                # Get variant length
                 svlen = info_dict.get("SVLEN")
                 if svlen:
                     svlen = abs(int(svlen))
                     if svlen < min_size or svlen > max_size:
                         continue
                 elif svtype == "BND":
-                    # Breakends don't have length, treat as min_size for now
                     svlen = min_size
                 else:
-                    # Try to infer from ALT
                     if alt.startswith("<"):
-                        # Symbolic alt without length info, skip if no SVLEN
                         continue
                     svlen = len(alt) - len(ref)
                     if svlen < min_size or svlen > max_size:
                         continue
 
-                # Get support count
+                n_total += 1
                 support = int(info_dict.get("SUPPORT", "0"))
 
-                # Extract inserted sequence from ALT if available
+                # Extract read names (from --output-rnames)
+                rnames_str = info_dict.get("RNAMES", "")
+                rnames = [r for r in rnames_str.split(",") if r] if rnames_str else []
+
                 if alt.startswith("<"):
-                    # Symbolic alt, no sequence
-                    sequence = "N" * svlen
+                    # Symbolic ALT — mark for assembly instead of filling N's
+                    n_symbolic += 1
+                    sequence = ""
                 else:
-                    # Sequence-resolved insertion
                     sequence = alt[len(ref):]
+                    if self._seq_entropy(sequence) < min_entropy:
+                        n_low_entropy += 1
+                        continue
 
                 insertions.append({
                     "UUID": str(uuid.uuid4()),
@@ -225,18 +256,130 @@ class SnifflesRunner:
                     "End": pos + svlen,
                     "Sequence": sequence,
                     "Support": support,
-                    "Family": f"Sniffles2_{svtype}",  # Tag with variant type
-                    "Subfamily": f"{organism}_{chrom}_{pos}",
+                    "Family": f"Sniffles2_{svtype}",
+                    "Subfamily": f"{sample_id}_{chrom}_{pos}",
+                    "Rnames": rnames,
                 })
 
+        logger.info(
+            f"  {sample_id} VCF: {n_total} calls, {n_symbolic} symbolic, "
+            f"{n_low_entropy} low-entropy filtered, {len(insertions)} kept"
+        )
         return insertions
+
+    def _assemble_insertion(
+        self,
+        bam_path: Path,
+        chrom: str,
+        pos: int,
+        svlen: int,
+        rnames: list[str],
+        work_dir: Path,
+        timeout: int = 120,
+    ) -> Optional[str]:
+        """Assemble a consensus for a symbolic ALT from supporting reads.
+
+        Extracts reads by name from the BAM region around the insertion,
+        then runs minimap2 overlap + miniasm to produce a consensus contig.
+
+        Returns the longest contig sequence, or None on failure.
+        """
+        if not rnames:
+            return None
+
+        rname_set = set(rnames)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        fastq_path = work_dir / "reads.fastq"
+
+        # Fetch supporting reads from the BAM around the insertion site
+        pad = max(svlen, 2000)
+        start = max(0, pos - pad)
+        end = pos + pad
+        n_written = 0
+
+        try:
+            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+                with open(fastq_path, "w") as fq:
+                    for read in bam.fetch(chrom, start, end):
+                        if read.query_name in rname_set and read.query_sequence:
+                            qual = read.query_qualities
+                            qual_str = (
+                                "".join(chr(q + 33) for q in qual)
+                                if qual is not None
+                                else "I" * len(read.query_sequence)
+                            )
+                            fq.write(
+                                f"@{read.query_name}\n"
+                                f"{read.query_sequence}\n"
+                                f"+\n"
+                                f"{qual_str}\n"
+                            )
+                            n_written += 1
+        except Exception as exc:
+            logger.debug(f"Failed to extract reads at {chrom}:{pos}: {exc}")
+            return None
+
+        if n_written < 3:
+            return None
+
+        # minimap2 all-vs-all overlap
+        overlaps_paf = work_dir / "overlaps.paf"
+        try:
+            result = subprocess.run(
+                ["minimap2", "-x", "ava-ont", "-t", "1",
+                 str(fastq_path), str(fastq_path)],
+                capture_output=True, timeout=timeout,
+            )
+            if result.returncode != 0:
+                return None
+            overlaps_paf.write_bytes(result.stdout)
+        except (subprocess.TimeoutExpired, Exception):
+            return None
+
+        if overlaps_paf.stat().st_size == 0:
+            return None
+
+        # miniasm assembly
+        raw_gfa = work_dir / "raw.gfa"
+        try:
+            result = subprocess.run(
+                ["miniasm", "-f", str(fastq_path), str(overlaps_paf)],
+                capture_output=True, timeout=timeout,
+            )
+            if result.returncode != 0:
+                return None
+            raw_gfa.write_bytes(result.stdout)
+        except (subprocess.TimeoutExpired, Exception):
+            return None
+
+        return self._parse_gfa_longest(raw_gfa)
+
+    @staticmethod
+    def _parse_gfa_longest(gfa_path: Path) -> Optional[str]:
+        """Parse GFA S-lines and return the longest contig sequence."""
+        longest = None
+        longest_len = 0
+        try:
+            with open(gfa_path) as fh:
+                for line in fh:
+                    if not line.startswith("S\t"):
+                        continue
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 3:
+                        continue
+                    seq = parts[2]
+                    if seq and len(seq) > longest_len:
+                        longest = seq
+                        longest_len = len(seq)
+        except Exception as exc:
+            logger.debug(f"Failed to parse GFA {gfa_path}: {exc}")
+            return None
+        return longest
 
     def _write_table(self, insertions: list[dict], output_path: Path):
         """Write insertion table in tldr-compatible format."""
         df = pd.DataFrame(insertions)
-        # Rename Sequence to Consensus to match tldr format
         df = df.rename(columns={"Sequence": "Consensus"})
-        # Reorder columns to match tldr format expectations
         cols = ["UUID", "Chrom", "Start", "End", "Family", "Subfamily", "Consensus", "Support"]
         df = df[cols]
         df.to_csv(output_path, sep="\t", index=False)
@@ -244,109 +387,95 @@ class SnifflesRunner:
     def run_batch(
         self,
         metadata: pd.DataFrame,
-        ref_map: dict[str, dict],
+        ref_map: dict[str, Path],
         parallel: int = 1,
         min_size: int = 500,
         max_size: int = 20000,
-        disable_qc: bool = True,
-        organism_col: str = "organism",
+        disable_qc: bool = False,
         accession_col: str = "srr_accession",
     ) -> dict[str, Optional[Path]]:
-        """Group samples by organism and run Sniffles2 for each group.
+        """Run Sniffles2 for each sample.
 
         Args:
-            metadata: DataFrame with organism and accession columns.
-            ref_map: Organism -> {accession, fasta, fai} from resolve step.
-            parallel: Number of organisms to run in parallel.
+            metadata: DataFrame with accession column.
+            ref_map: sample_id -> ref_fasta path.
+            parallel: Number of samples to run in parallel.
             min_size: Minimum insertion size in bp.
             max_size: Maximum insertion size in bp.
             disable_qc: Disable Sniffles2 quality control filters.
-            organism_col: Column name for organism.
             accession_col: Column name for SRR accession.
 
         Returns:
-            Dict mapping organism -> insertion table path (or None).
+            Dict mapping sample_id -> insertion table path (or None).
         """
         results: dict[str, Optional[Path]] = {}
-        groups = metadata.groupby(organism_col)
-
-        logger.info(f"Running Sniffles2 for {len(groups)} organism groups")
 
         # Build task list
-        tasks: list[tuple[str, list[Path], Path]] = []
-        for organism, group_df in groups:
-            ref_info = ref_map.get(organism)
-            if not ref_info:
-                logger.warning(f"No reference for {organism}, skipping Sniffles2")
-                results[organism] = None
+        tasks: list[tuple[str, Path, Path]] = []
+        for _, row in metadata.iterrows():
+            sid = row[accession_col]
+            ref_fasta = ref_map.get(sid)
+            if not ref_fasta:
+                logger.warning(f"No reference for {sid}, skipping Sniffles2")
+                results[sid] = None
                 continue
 
-            ref_fasta = Path(ref_info["fasta"])
-
-            bams = []
-            for _, row in group_df.iterrows():
-                sid = row[accession_col]
-                bam = self.alignment_dir / f"{sid}.sorted.bam"
-                if bam.exists():
-                    bams.append(bam)
-                else:
-                    logger.warning(f"BAM not found for {sid}: {bam}")
-
-            if not bams:
-                logger.warning(f"No BAMs found for {organism}, skipping")
-                results[organism] = None
+            bam = self.alignment_dir / f"{sid}.sorted.bam"
+            if not bam.exists():
+                logger.warning(f"BAM not found for {sid}: {bam}")
+                results[sid] = None
                 continue
 
-            tasks.append((organism, bams, ref_fasta))
+            tasks.append((sid, bam, ref_fasta))
+
+        logger.info(f"Running Sniffles2 for {len(tasks)} samples")
 
         if parallel <= 1:
-            # Sequential
-            for organism, bams, ref_fasta in tasks:
-                table = self.run_organism_group(
-                    bams=bams, ref_fasta=ref_fasta,
-                    organism=organism, min_size=min_size, max_size=max_size,
+            for sid, bam, ref_fasta in tasks:
+                table = self.run_sample(
+                    bam=bam, ref_fasta=ref_fasta,
+                    sample_id=sid, min_size=min_size, max_size=max_size,
                     disable_qc=disable_qc,
                 )
-                results[organism] = table
+                results[sid] = table
         else:
-            # Parallel execution
-            logger.info(f"Running {len(tasks)} organisms with {parallel} in parallel")
+            logger.info(f"Running {len(tasks)} samples with {parallel} in parallel")
             with ProcessPoolExecutor(max_workers=parallel) as pool:
                 futures = {}
-                for organism, bams, ref_fasta in tasks:
+                for sid, bam, ref_fasta in tasks:
                     fut = pool.submit(
                         _run_sniffles_worker,
-                        bams=bams,
+                        bam=bam,
                         ref_fasta=ref_fasta,
-                        organism=organism,
+                        sample_id=sid,
                         min_size=min_size,
                         max_size=max_size,
                         disable_qc=disable_qc,
                         output_dir=self.output_dir,
                         alignment_dir=self.alignment_dir,
                     )
-                    futures[fut] = organism
+                    futures[fut] = sid
 
                 for fut in as_completed(futures):
-                    organism = futures[fut]
+                    sid = futures[fut]
                     try:
                         table = fut.result()
-                        results[organism] = table
+                        results[sid] = table
                         if table:
                             logger.info(f"  -> {table}")
                     except Exception as e:
-                        logger.error(f"Sniffles2 worker failed for {organism}: {e}")
-                        results[organism] = None
+                        logger.error(f"Sniffles2 worker failed for {sid}: {e}")
+                        results[sid] = None
 
         ok = sum(1 for v in results.values() if v)
-        logger.info(f"Sniffles2 complete: {ok}/{len(results)} organism groups succeeded")
+        logger.info(f"Sniffles2 complete: {ok}/{len(results)} samples succeeded")
         return results
 
 
 def _run_sniffles_worker(
-    bams: list[Path],
+    bam: Path,
     ref_fasta: Path,
-    organism: str,
+    sample_id: str,
     min_size: int,
     max_size: int,
     disable_qc: bool,
@@ -358,10 +487,10 @@ def _run_sniffles_worker(
         output_dir=str(output_dir),
         alignment_dir=str(alignment_dir),
     )
-    return runner.run_organism_group(
-        bams=bams,
+    return runner.run_sample(
+        bam=bam,
         ref_fasta=ref_fasta,
-        organism=organism,
+        sample_id=sample_id,
         min_size=min_size,
         max_size=max_size,
         disable_qc=disable_qc,
