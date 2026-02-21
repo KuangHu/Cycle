@@ -387,7 +387,8 @@ class CircleFinder:
         junction_reads: list[dict] = []
         total_mapped: dict[str, int] = {}
         counts: dict[str, dict[str, int]] = {}  # uuid -> {type -> count}
-        th_example: dict[str, str] = {}  # uuid -> first tail-head read sequence
+        # uuid -> (mapq, length, sequence) for best tail-head example read
+        th_example: dict[str, tuple[int, int, str]] = {}
 
         bam = pysam.AlignmentFile(str(bam_path), "rb")
         for read in bam.fetch():
@@ -426,9 +427,14 @@ class CircleFinder:
                     )
 
                     if (junction_type == "tail_head"
-                            and uuid not in th_example
                             and read.query_sequence):
-                        th_example[uuid] = read.query_sequence
+                        candidate = (
+                            read.mapping_quality,
+                            len(read.query_sequence),
+                            read.query_sequence,
+                        )
+                        if uuid not in th_example or candidate[:2] > th_example[uuid][:2]:
+                            th_example[uuid] = candidate
 
                     junction_reads.append({
                         "read_id": read.query_name,
@@ -468,7 +474,7 @@ class CircleFinder:
                 "n_genome_head_reads": uuid_counts.get("genome_head", 0),
                 "n_tail_genome_reads": uuid_counts.get("tail_genome", 0),
                 "n_total_mapped": total_mapped.get(uuid, 0),
-                "example_th_read": th_example.get(uuid, ""),
+                "example_th_read": th_example[uuid][2] if uuid in th_example else "",
             }
 
         return junction_reads, summary_by_uuid
