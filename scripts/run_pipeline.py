@@ -164,6 +164,8 @@ def parse_args():
     args = parser.parse_args()
 
     # When --outdir is set, derive all subdirectories from it
+    # Explicit --formatter-dir takes precedence over --outdir derivation
+    explicit_formatter_dir = args.formatter_dir
     if args.outdir:
         out = Path(args.outdir)
         args.fastq_dir = str(out / "sra_downloads")
@@ -174,6 +176,8 @@ def parse_args():
         args.sniffles_dir = str(out / "sniffles_output")
         args.circle_dir = str(out / "circle_output")
         args.formatter_dir = str(out / "is_formatter_output")
+    if explicit_formatter_dir is not None:
+        args.formatter_dir = explicit_formatter_dir
 
     # Set default for sniffles_dir if not provided
     if args.sniffles_dir is None:
