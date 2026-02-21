@@ -7,8 +7,8 @@ Chains up to 9 stages:
   3. index     — build minimap2 .mmi indices
   4. align     — minimap2 + samtools sort -> sorted BAM + .bai
   5. is_ref    — build IS element reference FASTA (for tldr only)
-  6. tldr      — run tldr per organism group (IS detection via reference library)
-  6alt. sniffles — run Sniffles2 per organism (SV-based insertion detection, faster)
+  6. tldr      — run tldr per sample (IS detection via reference library)
+  6alt. sniffles — run Sniffles2 per sample (SV-based insertion detection, faster)
   7. circle    — detect IS circular intermediates via concatemer bait
   8. format    — extract IS elements + flanking regions via local assembly
 
@@ -51,7 +51,7 @@ from cycle.is_formatter.config import (
     DEFAULT_FLANK_SIZE,
     DEFAULT_FORMATTER_OUTPUT_DIR,
 )
-from cycle.utils import find_fastq, slugify
+from cycle.utils import find_fastq
 
 ALL_STEPS = ["download", "resolve", "index", "align", "is_ref", "tldr", "sniffles", "circle", "format"]
 
@@ -71,7 +71,7 @@ def parse_args():
     parser.add_argument(
         "--outdir", default=None,
         help="Root output directory.  When set, all subdirectories (fastqs, "
-             "reference_genomes, alignments, …) are placed under this path "
+             "reference_genomes, alignments, ...) are placed under this path "
              "and the individual --*-dir flags are ignored.",
     )
     parser.add_argument(
@@ -107,20 +107,12 @@ def parse_args():
         help="Number of processes per tldr invocation. Default: 8",
     )
     parser.add_argument(
-        "--tldr-parallel", type=int, default=1,
-        help="Number of organisms to run tldr on in parallel. Default: 1",
+        "--parallel", type=int, default=1,
+        help="Number of samples to process in parallel (used by all steps). Default: 1",
     )
     parser.add_argument(
         "--sniffles-dir", default=None,
         help=f"Directory for Sniffles2 output. Default: derived from --outdir or {DEFAULT_SNIFFLES_OUTPUT_DIR}",
-    )
-    parser.add_argument(
-        "--sniffles-parallel", type=int, default=1,
-        help="Number of organisms to run Sniffles2 on in parallel. Default: 1",
-    )
-    parser.add_argument(
-        "--circle-parallel", type=int, default=1,
-        help="Number of organisms to run circle detection on in parallel. Default: 1",
     )
     parser.add_argument(
         "--preset", default=DEFAULT_MINIMAP2_PRESET,
@@ -159,12 +151,14 @@ def parse_args():
         help=f"Directory for IS formatter output. Default: derived from --outdir or {DEFAULT_FORMATTER_OUTPUT_DIR}",
     )
     parser.add_argument(
-        "--formatter-parallel", type=int, default=1,
-        help="Number of organisms to run IS formatting on in parallel. Default: 1",
-    )
-    parser.add_argument(
         "--formatter-flank-size", type=int, default=DEFAULT_FLANK_SIZE,
         help=f"Flanking region size (bp) for IS extraction. Default: {DEFAULT_FLANK_SIZE}",
+    )
+    parser.add_argument(
+        "--no-require-th", action="store_true",
+        help="Process all IS elements with mapped reads, not just those with "
+             "tail-head junction reads. By default only TH-positive elements "
+             "are assembled (much faster).",
     )
 
     args = parser.parse_args()
@@ -191,6 +185,10 @@ def parse_args():
 
     return args
 
+
+# ------------------------------------------------------------------
+# Discovery helpers
+# ------------------------------------------------------------------
 
 def discover_resolve_status(ref_dir: Path) -> dict[str, dict]:
     """Read organism-keyed ref_map from resolve_status.tsv saved by the resolve stage."""
@@ -242,25 +240,20 @@ def discover_organism_refs(
 ) -> dict[str, dict]:
     """Build organism-keyed ref_map from alignment_status.tsv on disk.
 
-    Uses the alignment status file to map sample → reference FASTA, then
-    joins with metadata to get organism → reference FASTA.
+    Used by stages 1-4 which still work organism-keyed internally.
     """
     ref_map: dict[str, dict] = {}
     status_file = align_dir / "alignment_status.tsv"
     if not status_file.exists():
-        # Fall back to accession-keyed map (won't match organism lookups,
-        # but callers handle missing keys gracefully)
         return discover_existing_refs(ref_dir)
 
     status = pd.read_csv(status_file, sep="\t")
-    # Build sample_id -> reference path
     sample_ref = {}
     for _, row in status.iterrows():
         ref_path = row.get("reference", "")
         if ref_path and row.get("status") == "ok":
             sample_ref[row["sample_id"]] = Path(ref_path)
 
-    # Map organism -> reference FASTA (use first sample's reference per organism)
     for _, row in metadata.iterrows():
         org = row.get(organism_col, "")
         sid = row.get(accession_col, "")
@@ -279,25 +272,63 @@ def discover_organism_refs(
     return ref_map
 
 
-def discover_tldr_tables(
-    tldr_dir: Path, metadata, organism_col: str = "organism",
+def build_sample_ref_map(align_dir: Path) -> dict[str, Path]:
+    """Read alignment_status.tsv and return {sample_id: ref_fasta_path}.
+
+    Used by stages 5+ which work sample-keyed.
+    """
+    sample_refs: dict[str, Path] = {}
+    status_file = align_dir / "alignment_status.tsv"
+    if not status_file.exists():
+        logger.warning(f"alignment_status.tsv not found in {align_dir}")
+        return sample_refs
+
+    status = pd.read_csv(status_file, sep="\t")
+    for _, row in status.iterrows():
+        ref_path = row.get("reference", "")
+        if ref_path and row.get("status") == "ok":
+            p = Path(ref_path)
+            if p.exists():
+                sample_refs[row["sample_id"]] = p
+
+    logger.info(f"Built sample ref map: {len(sample_refs)} samples with references")
+    return sample_refs
+
+
+def discover_sample_tables(
+    step_dir: Path, metadata: pd.DataFrame, accession_col: str = "srr_accession",
 ) -> dict[str, Path | None]:
-    """Scan tldr_dir for existing .table.txt files, keyed by organism name."""
+    """Scan for per-sample .table.txt files: {step_dir}/{sample_id}/{sample_id}.table.txt"""
     results: dict[str, Path | None] = {}
-    if not tldr_dir.exists():
+    if not step_dir.exists():
         return results
 
-    organisms = metadata[organism_col].unique()
-    for organism in organisms:
-        slug = slugify(organism)
-        table = tldr_dir / slug / f"{slug}.table.txt"
-        if table.exists():
-            results[organism] = table
-        else:
-            results[organism] = None
+    for _, row in metadata.iterrows():
+        sid = row[accession_col]
+        table = step_dir / sid / f"{sid}.table.txt"
+        results[sid] = table if table.exists() else None
 
     found = sum(1 for v in results.values() if v)
-    logger.info(f"Discovered {found}/{len(results)} existing tldr tables in {tldr_dir}")
+    logger.info(f"Discovered {found}/{len(results)} existing tables in {step_dir}")
+    return results
+
+
+def discover_sample_circle_dirs(
+    circle_dir: Path, metadata: pd.DataFrame, accession_col: str = "srr_accession",
+) -> dict[str, Path | None]:
+    """Scan for per-sample circle output: {circle_dir}/{sample_id}/{sample_id}_circle_summary.tsv"""
+    results: dict[str, Path | None] = {}
+    if not circle_dir.exists():
+        return results
+
+    for _, row in metadata.iterrows():
+        sid = row[accession_col]
+        sample_circle_dir = circle_dir / sid
+        summary = sample_circle_dir / f"{sid}_circle_summary.tsv"
+        results[sid] = sample_circle_dir if summary.exists() else None
+
+    found = sum(1 for v in results.values() if v)
+    logger.info(f"Discovered {found}/{len(results)} circle output directories in {circle_dir}")
     return results
 
 
@@ -454,16 +485,31 @@ def main():
         builder = ISReferenceBuilder(output_dir=args.is_dir)
         builder.build(families=args.is_families)
 
+    # ── Build sample-level ref_map for stages 6+ ─────────────────────
+    sample_refs: dict[str, Path] = {}
+    needs_sample_refs = steps & {"tldr", "sniffles", "circle"}
+    if needs_sample_refs:
+        sample_refs = build_sample_ref_map(Path(args.align_dir))
+        if not sample_refs:
+            # Fall back: build from organism ref_map + metadata
+            if not ref_map:
+                ref_map = discover_organism_refs(
+                    Path(args.align_dir), metadata, Path(args.ref_dir),
+                )
+            for _, row in metadata.iterrows():
+                sid = row["srr_accession"]
+                org = row.get("organism", "")
+                ref_info = ref_map.get(org)
+                if ref_info:
+                    sample_refs[sid] = Path(ref_info["fasta"])
+            if sample_refs:
+                logger.info(f"Built sample ref map from organism refs: {len(sample_refs)} samples")
+
     # ── Stage 6: tldr ────────────────────────────────────────────────
     if "tldr" in steps:
         logger.info("=" * 60)
         logger.info("STAGE 6: tldr — detecting transposon insertions")
         logger.info("=" * 60)
-
-        if not ref_map:
-            ref_map = discover_organism_refs(
-                Path(args.align_dir), metadata, Path(args.ref_dir),
-            )
 
         is_ref_path = Path(args.is_dir) / "is_reference.fa"
         if not is_ref_path.exists():
@@ -477,14 +523,14 @@ def main():
         )
         tldr_results = runner.run_batch(
             metadata=metadata,
-            ref_map=ref_map,
+            ref_map=sample_refs,
             is_ref=is_ref_path,
             procs=args.tldr_procs,
-            parallel=args.tldr_parallel,
+            parallel=args.parallel,
         )
 
         ok = sum(1 for v in tldr_results.values() if v)
-        logger.info(f"tldr: {ok}/{len(tldr_results)} organism groups produced results")
+        logger.info(f"tldr: {ok}/{len(tldr_results)} samples produced results")
 
     # ── Stage 6alt: Sniffles2 ────────────────────────────────────────
     sniffles_results: dict[str, Path | None] = {}
@@ -493,23 +539,18 @@ def main():
         logger.info("STAGE 6alt: sniffles — detecting insertions with Sniffles2")
         logger.info("=" * 60)
 
-        if not ref_map:
-            ref_map = discover_organism_refs(
-                Path(args.align_dir), metadata, Path(args.ref_dir),
-            )
-
         runner = SnifflesRunner(
             output_dir=args.sniffles_dir,
             alignment_dir=args.align_dir,
         )
         sniffles_results = runner.run_batch(
             metadata=metadata,
-            ref_map=ref_map,
-            parallel=args.sniffles_parallel,
+            ref_map=sample_refs,
+            parallel=args.parallel,
         )
 
         ok = sum(1 for v in sniffles_results.values() if v)
-        logger.info(f"Sniffles2: {ok}/{len(sniffles_results)} organism groups produced results")
+        logger.info(f"Sniffles2: {ok}/{len(sniffles_results)} samples produced results")
 
     # ── Stage 7: Circle detection ─────────────────────────────────────
     if "circle" in steps:
@@ -527,29 +568,21 @@ def main():
             logger.info("Using Sniffles2 results for circle detection")
         else:
             # Try to discover from disk
-            tldr_results = discover_tldr_tables(
+            insertion_results = discover_sample_tables(
                 Path(args.tldr_dir), metadata,
             )
-            if any(tldr_results.values()):
-                insertion_results = tldr_results
-                logger.info("Using discovered tldr results for circle detection")
-            else:
-                # Try sniffles directory
-                sniffles_results = discover_tldr_tables(
+            if not any(insertion_results.values()):
+                insertion_results = discover_sample_tables(
                     Path(args.sniffles_dir), metadata,
                 )
-                if any(sniffles_results.values()):
-                    insertion_results = sniffles_results
+                if any(insertion_results.values()):
                     logger.info("Using discovered Sniffles2 results for circle detection")
+            else:
+                logger.info("Using discovered tldr results for circle detection")
 
         if not any(insertion_results.values()):
             logger.error("No insertion tables found. Run tldr or sniffles step first.")
             sys.exit(1)
-
-        if not ref_map:
-            ref_map = discover_organism_refs(
-                Path(args.align_dir), metadata, Path(args.ref_dir),
-            )
 
         finder = CircleFinder(
             output_dir=args.circle_dir,
@@ -562,13 +595,13 @@ def main():
             tldr_results=insertion_results,
             metadata=metadata,
             fastq_dir=args.fastq_dir,
-            ref_map=ref_map if ref_map else None,
-            parallel=args.circle_parallel,
+            ref_map=sample_refs if sample_refs else None,
+            parallel=args.parallel,
         )
 
         ok = sum(1 for v in circle_results.values() if v)
         logger.info(
-            f"Circle detection: {ok}/{len(circle_results)} organism groups processed"
+            f"Circle detection: {ok}/{len(circle_results)} samples processed"
         )
 
     # ── Stage 8: IS formatting ────────────────────────────────────────
@@ -578,25 +611,10 @@ def main():
         logger.info("=" * 60)
 
         # Discover circle results if not available from current session
-        circle_dir = Path(args.circle_dir)
         if not any(circle_results.values()):
-            # Discover circle output directories from disk
-            circle_results = {}
-            if circle_dir.exists():
-                organisms = metadata["organism"].unique()
-                for org in organisms:
-                    slug_name = slugify(org)
-                    org_circle_dir = circle_dir / slug_name
-                    summary = org_circle_dir / f"{slug_name}_circle_summary.tsv"
-                    if summary.exists():
-                        circle_results[org] = org_circle_dir
-                    else:
-                        circle_results[org] = None
-                found = sum(1 for v in circle_results.values() if v)
-                logger.info(
-                    f"Discovered {found}/{len(circle_results)} circle output "
-                    f"directories in {circle_dir}"
-                )
+            circle_results = discover_sample_circle_dirs(
+                Path(args.circle_dir), metadata,
+            )
 
         if not any(circle_results.values()):
             logger.error(
@@ -607,17 +625,17 @@ def main():
         formatter = ISFormatter(
             output_dir=args.formatter_dir,
             flank_size=args.formatter_flank_size,
+            require_th_reads=not args.no_require_th,
             threads=args.threads,
         )
         format_results = formatter.run_batch(
             circle_results=circle_results,
-            metadata=metadata,
-            parallel=args.formatter_parallel,
+            parallel=args.parallel,
         )
 
         ok = sum(1 for v in format_results.values() if v)
         logger.info(
-            f"IS formatting: {ok}/{len(format_results)} organism groups processed"
+            f"IS formatting: {ok}/{len(format_results)} samples processed"
         )
 
     logger.info("Pipeline complete.")

@@ -7,7 +7,7 @@ For each IS consensus from tldr, two bait sequences are built:
 2. **Insertion-context bait** ``[upstream_flank][IS][downstream_flank]`` — reads
    spanning the genome-head or tail-genome junctions confirm genomic integration.
 
-Both baits are combined into a single FASTA per organism so each FASTQ is
+Both baits are combined into a single FASTA per sample so each FASTQ is
 mapped only once.
 """
 
@@ -24,7 +24,7 @@ from typing import Optional
 
 import pysam
 
-from ..utils import find_fastq, slugify
+from ..utils import find_fastq
 from .config import (
     DEFAULT_CIRCLE_OUTPUT_DIR,
     DEFAULT_FLANK_LENGTH,
@@ -52,11 +52,11 @@ class ISEntry:
 class CircleFinder:
     """Detect IS circular intermediates and insertion boundaries via bait mapping.
 
-    For each organism group, bait sequences are built for all IS elements from
-    tldr: concatemer baits for tail-head junctions and (when a reference genome
-    is provided) insertion-context baits for genome-head and tail-genome
-    junctions.  Each sample FASTQ is mapped once against the combined bait
-    FASTA.
+    For each sample, bait sequences are built for all IS elements from
+    tldr/sniffles: concatemer baits for tail-head junctions and (when a
+    reference genome is provided) insertion-context baits for genome-head and
+    tail-genome junctions.  The sample's FASTQ is mapped once against the
+    combined bait FASTA.
     """
 
     def __init__(
@@ -157,8 +157,6 @@ class CircleFinder:
 
         contig_length = fa.get_reference_length(entry.chrom)
 
-        # Ensure valid coordinates (some SVs can have end < start or
-        # coordinates beyond contig length)
         start = min(entry.start, entry.end)
         end = max(entry.start, entry.end)
         start = max(0, min(start, contig_length))
@@ -268,7 +266,6 @@ class CircleFinder:
                 ref_name = line[1:].strip().split()[0]
 
                 if "__th__j" in ref_name:
-                    # Tail-head format: {uuid}__th__j{N}
                     parts = ref_name.split("__th__j")
                     uuid = parts[0]
                     junction_pos = int(parts[1])
@@ -277,7 +274,6 @@ class CircleFinder:
                     ]
 
                 elif "__ic__j" in ref_name:
-                    # Insertion-context: {uuid}__ic__j{J1}_j{J2}__fl{FLANK}
                     uuid = ref_name.split("__ic__")[0]
                     jpart = ref_name.split("__ic__j")[1].split("__fl")[0]
                     j1_str, j2_str = jpart.split("_j")
@@ -288,7 +284,6 @@ class CircleFinder:
                     ]
 
                 elif "__len" in ref_name:
-                    # Legacy format: {uuid}__len{N}
                     parts = ref_name.rsplit("__len", 1)
                     uuid = parts[0]
                     junction_pos = int(parts[1])
@@ -330,7 +325,7 @@ class CircleFinder:
             "-",
         ]
 
-        logger.info(f"Mapping {fastq.name} → {output_bam.name}")
+        logger.info(f"Mapping {fastq.name} -> {output_bam.name}")
         try:
             mm2_proc = subprocess.Popen(
                 mm2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -367,7 +362,7 @@ class CircleFinder:
             logger.error(f"samtools index failed: {ret.stderr.strip()}")
             return None
 
-        logger.info(f"  → {output_bam} + .bai")
+        logger.info(f"  -> {output_bam} + .bai")
         return output_bam
 
     def _find_junction_reads(
@@ -392,6 +387,7 @@ class CircleFinder:
         junction_reads: list[dict] = []
         total_mapped: dict[str, int] = {}
         counts: dict[str, dict[str, int]] = {}  # uuid -> {type -> count}
+        th_example: dict[str, str] = {}  # uuid -> first tail-head read sequence
 
         bam = pysam.AlignmentFile(str(bam_path), "rb")
         for read in bam.fetch():
@@ -428,6 +424,11 @@ class CircleFinder:
                     counts[uuid][junction_type] = (
                         counts[uuid].get(junction_type, 0) + 1
                     )
+
+                    if (junction_type == "tail_head"
+                            and uuid not in th_example
+                            and read.query_sequence):
+                        th_example[uuid] = read.query_sequence
 
                     junction_reads.append({
                         "read_id": read.query_name,
@@ -467,6 +468,7 @@ class CircleFinder:
                 "n_genome_head_reads": uuid_counts.get("genome_head", 0),
                 "n_tail_genome_reads": uuid_counts.get("tail_genome", 0),
                 "n_total_mapped": total_mapped.get(uuid, 0),
+                "example_th_read": th_example.get(uuid, ""),
             }
 
         return junction_reads, summary_by_uuid
@@ -475,196 +477,165 @@ class CircleFinder:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_organism(
+    def run_sample(
         self,
         tldr_table: Path,
-        fastqs: list[tuple[str, Path]],
-        organism: str,
+        sample_id: str,
+        fastq_path: Path,
         ref_fasta: Path | None = None,
     ) -> Optional[Path]:
-        """Run circle detection for one organism group.
+        """Run circle detection for one sample.
 
         Args:
-            tldr_table: Path to the tldr .table.txt for this organism.
-            fastqs: List of (sample_id, fastq_path) tuples.
-            organism: Organism name (for output directory naming).
+            tldr_table: Path to the tldr/sniffles .table.txt for this sample.
+            sample_id: Sample accession.
+            fastq_path: Path to the sample's FASTQ file.
             ref_fasta: Optional reference genome FASTA for insertion-context
                 baits.  When ``None``, only tail-head junctions are detected.
 
         Returns:
-            Path to the organism output directory, or ``None`` on failure.
+            Path to the sample output directory, or ``None`` on failure.
         """
-        slug = slugify(organism)
-        org_dir = self.output_dir / slug
-        org_dir.mkdir(parents=True, exist_ok=True)
+        sample_dir = self.output_dir / sample_id
+        sample_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Parse tldr table
         entries = self._parse_tldr_table(tldr_table)
         if not entries:
             logger.warning(
-                f"No valid IS entries for {organism}, skipping circle detection"
+                f"No valid IS entries for {sample_id}, skipping circle detection"
             )
             return None
 
         entries_by_uuid = {e.uuid: e for e in entries}
 
         # 2. Build bait FASTA (concatemer + insertion-context)
-        bait_path = org_dir / f"{slug}_bait.fa"
+        bait_path = sample_dir / f"{sample_id}_bait.fa"
         bait_path, junction_map = self._build_bait_fasta(
             entries, bait_path, ref_fasta,
         )
 
-        # 3. Map each FASTQ and collect junction reads
-        all_junction_reads: list[dict] = []
-        combined_summary: dict[str, dict] = {}
+        # 3. Map FASTQ and collect junction reads
+        bam_path = sample_dir / f"{sample_id}.circle.sorted.bam"
+        bam = self._map_reads(fastq_path, bait_path, bam_path)
+        if bam is None:
+            logger.warning(f"Mapping failed for {sample_id}, skipping")
+            return None
 
-        for sample_id, fastq_path in fastqs:
-            bam_path = org_dir / f"{sample_id}.circle.sorted.bam"
-            bam = self._map_reads(fastq_path, bait_path, bam_path)
-            if bam is None:
-                logger.warning(f"Mapping failed for {sample_id}, skipping")
-                continue
+        junction_reads, summary_by_uuid = self._find_junction_reads(
+            bam, entries_by_uuid, junction_map, sample_id,
+        )
 
-            jreads, summary = self._find_junction_reads(
-                bam, entries_by_uuid, junction_map, sample_id,
-            )
-            all_junction_reads.extend(jreads)
-
-            # Merge summary: accumulate counts across samples
-            for uuid, stats in summary.items():
-                if uuid not in combined_summary:
-                    combined_summary[uuid] = dict(stats)
-                else:
-                    combined_summary[uuid]["n_tail_head_reads"] += stats["n_tail_head_reads"]
-                    combined_summary[uuid]["n_genome_head_reads"] += stats["n_genome_head_reads"]
-                    combined_summary[uuid]["n_tail_genome_reads"] += stats["n_tail_genome_reads"]
-                    combined_summary[uuid]["n_total_mapped"] += stats["n_total_mapped"]
-
-            logger.info(
-                f"  {sample_id}: {len(jreads)} junction reads found"
-            )
+        logger.info(
+            f"  {sample_id}: {len(junction_reads)} junction reads found"
+        )
 
         # 4. Write output TSVs
-        reads_tsv = org_dir / f"{slug}_circle_reads.tsv"
-        _write_tsv(reads_tsv, all_junction_reads, [
+        reads_tsv = sample_dir / f"{sample_id}_circle_reads.tsv"
+        _write_tsv(reads_tsv, junction_reads, [
             "read_id", "sample_id", "is_uuid", "junction_type", "chrom",
             "start", "end", "family", "subfamily", "read_length",
             "alignment_start", "alignment_end", "junction_pos",
             "overlap_left", "overlap_right", "mapping_quality",
         ])
 
-        summary_tsv = org_dir / f"{slug}_circle_summary.tsv"
-        summary_rows = list(combined_summary.values())
+        summary_tsv = sample_dir / f"{sample_id}_circle_summary.tsv"
+        summary_rows = list(summary_by_uuid.values())
         _write_tsv(summary_tsv, summary_rows, [
             "is_uuid", "chrom", "start", "end", "family", "subfamily",
             "consensus_length", "consensus", "n_tail_head_reads",
             "n_genome_head_reads", "n_tail_genome_reads", "n_total_mapped",
+            "example_th_read",
         ])
 
         total_junctions = sum(
             s["n_tail_head_reads"] + s["n_genome_head_reads"]
             + s["n_tail_genome_reads"]
-            for s in combined_summary.values()
+            for s in summary_by_uuid.values()
         )
         logger.info(
-            f"Circle detection for {organism}: {total_junctions} junction "
+            f"Circle detection for {sample_id}: {total_junctions} junction "
             f"reads across {len(entries)} IS elements"
         )
-        return org_dir
+        return sample_dir
 
     def run_batch(
         self,
         tldr_results: dict[str, Optional[Path]],
         metadata,
         fastq_dir: str | Path,
-        organism_col: str = "organism",
         accession_col: str = "srr_accession",
-        ref_map: dict[str, dict] | None = None,
+        ref_map: dict[str, Path] | None = None,
         parallel: int = 1,
     ) -> dict[str, Optional[Path]]:
-        """Run circle detection for all organism groups.
+        """Run circle detection for all samples.
 
         Args:
-            tldr_results: Organism -> tldr table path mapping.
-            metadata: DataFrame with organism and accession columns.
+            tldr_results: sample_id -> tldr table path mapping.
+            metadata: DataFrame with accession column.
             fastq_dir: Directory containing FASTQ files.
-            organism_col: Column name for organism.
             accession_col: Column name for SRR accession.
-            ref_map: Optional organism -> reference info dict.  When provided,
+            ref_map: Optional sample_id -> ref_fasta path.  When provided,
                 insertion-context baits are built for genome-head and
                 tail-genome junction detection.
-            parallel: Number of organisms to process in parallel.
+            parallel: Number of samples to process in parallel.
 
         Returns:
-            Dict mapping organism -> circle output directory (or None).
+            Dict mapping sample_id -> circle output directory (or None).
         """
         fastq_dir = Path(fastq_dir)
         results: dict[str, Optional[Path]] = {}
-        groups = metadata.groupby(organism_col)
-
-        logger.info(f"Running circle detection for {len(groups)} organism groups")
 
         # Collect tasks
-        tasks: list[tuple[str, list[tuple[str, Path]], Path, Path | None]] = []
-        for organism, group_df in groups:
-            table_path = tldr_results.get(organism)
+        tasks: list[tuple[str, Path, Path, Path | None]] = []
+        for _, row in metadata.iterrows():
+            sid = row[accession_col]
+            table_path = tldr_results.get(sid)
             if not table_path:
                 logger.warning(
-                    f"No tldr table for {organism}, skipping circle detection"
+                    f"No insertion table for {sid}, skipping circle detection"
                 )
-                results[organism] = None
+                results[sid] = None
                 continue
 
-            # Collect FASTQs for this organism
-            fastqs: list[tuple[str, Path]] = []
-            for _, row in group_df.iterrows():
-                sid = row[accession_col]
-                fq = find_fastq(fastq_dir, sid)
-                if fq:
-                    fastqs.append((sid, fq))
-                else:
-                    logger.warning(f"No FASTQ found for {sid}")
-
-            if not fastqs:
-                logger.warning(f"No FASTQs found for {organism}, skipping")
-                results[organism] = None
+            fq = find_fastq(fastq_dir, sid)
+            if not fq:
+                logger.warning(f"No FASTQ found for {sid}")
+                results[sid] = None
                 continue
 
-            # Look up reference FASTA for insertion-context baits
             ref_fasta = None
             if ref_map:
-                ref_info = ref_map.get(organism)
-                if ref_info:
-                    ref_fasta = ref_info.get("fasta")
+                ref_fasta = ref_map.get(sid)
 
-            tasks.append((organism, fastqs, table_path, ref_fasta))
+            tasks.append((sid, fq, table_path, ref_fasta))
+
+        logger.info(f"Running circle detection for {len(tasks)} samples")
 
         if parallel <= 1:
-            # Sequential
-            for organism, fastqs, table_path, ref_fasta in tasks:
+            for sid, fq, table_path, ref_fasta in tasks:
                 try:
-                    out = self.run_organism(
+                    out = self.run_sample(
                         tldr_table=table_path,
-                        fastqs=fastqs,
-                        organism=organism,
+                        sample_id=sid,
+                        fastq_path=fq,
                         ref_fasta=ref_fasta,
                     )
-                    results[organism] = out
+                    results[sid] = out
                 except Exception as exc:
                     logger.error(
-                        f"Circle detection failed for {organism}, skipping: {exc}"
+                        f"Circle detection failed for {sid}, skipping: {exc}"
                     )
-                    results[organism] = None
+                    results[sid] = None
         else:
-            # Parallel execution
-            logger.info(f"Running {len(tasks)} organisms with {parallel} in parallel")
+            logger.info(f"Running {len(tasks)} samples with {parallel} in parallel")
             with ProcessPoolExecutor(max_workers=parallel) as pool:
                 futures = {}
-                for organism, fastqs, table_path, ref_fasta in tasks:
+                for sid, fq, table_path, ref_fasta in tasks:
                     fut = pool.submit(
                         _run_circle_worker,
-                        organism=organism,
-                        fastqs=fastqs,
+                        sample_id=sid,
+                        fastq_path=fq,
                         table_path=table_path,
                         ref_fasta=ref_fasta,
                         output_dir=self.output_dir,
@@ -675,32 +646,31 @@ class CircleFinder:
                         flank_length=self.flank_length,
                         min_consensus_entropy=self.min_consensus_entropy,
                     )
-                    futures[fut] = organism
+                    futures[fut] = sid
 
                 for fut in as_completed(futures):
-                    organism = futures[fut]
+                    sid = futures[fut]
                     try:
                         out = fut.result()
-                        results[organism] = out
+                        results[sid] = out
                         if out:
                             logger.info(f"  -> {out}")
                     except Exception as exc:
                         logger.error(
-                            f"Circle detection worker failed for {organism}: {exc}"
+                            f"Circle detection worker failed for {sid}: {exc}"
                         )
-                        results[organism] = None
+                        results[sid] = None
 
         ok = sum(1 for v in results.values() if v)
         logger.info(
-            f"Circle detection complete: {ok}/{len(results)} organism groups "
-            f"processed"
+            f"Circle detection complete: {ok}/{len(results)} samples processed"
         )
         return results
 
 
 def _run_circle_worker(
-    organism: str,
-    fastqs: list[tuple[str, Path]],
+    sample_id: str,
+    fastq_path: Path,
     table_path: Path,
     ref_fasta: Path | None,
     output_dir: Path,
@@ -721,10 +691,10 @@ def _run_circle_worker(
         flank_length=flank_length,
         min_consensus_entropy=min_consensus_entropy,
     )
-    return finder.run_organism(
+    return finder.run_sample(
         tldr_table=table_path,
-        fastqs=fastqs,
-        organism=organism,
+        sample_id=sample_id,
+        fastq_path=fastq_path,
         ref_fasta=ref_fasta,
     )
 

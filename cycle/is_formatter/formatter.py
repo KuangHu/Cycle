@@ -4,7 +4,7 @@ After circle detection, reads mapped to IS bait sequences are extracted,
 assembled per IS element with miniasm + minipolish, and the IS consensus is
 located within the assembled contig to extract upstream/downstream flanks.
 
-Output: JSON (ISExtractor-compatible) and TSV per organism.
+Output: JSON (ISExtractor-compatible) and TSV per sample.
 """
 
 import csv
@@ -21,7 +21,6 @@ from typing import Optional
 
 import pysam
 
-from ..utils import slugify
 from .config import (
     DEFAULT_ASSEMBLY_TIMEOUT,
     DEFAULT_FLANK_SIZE,
@@ -48,11 +47,13 @@ class ISFormatter:
         min_reads: int = DEFAULT_MIN_READS_FOR_ASSEMBLY,
         assembly_timeout: int = DEFAULT_ASSEMBLY_TIMEOUT,
         min_entropy: float = DEFAULT_MIN_ENTROPY,
+        require_th_reads: bool = True,
         threads: int = 4,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.flank_size = flank_size
+        self.require_th_reads = require_th_reads
         self.min_reads = min_reads
         self.assembly_timeout = assembly_timeout
         self.min_entropy = min_entropy
@@ -87,11 +88,13 @@ class ISFormatter:
         """Load circle summary TSV and return IS entries with good consensus.
 
         Filters out entries with no mapped reads or low-complexity consensus
-        (entropy below ``min_entropy``).
+        (entropy below ``min_entropy``).  When ``require_th_reads`` is True,
+        also skips entries with zero tail-head junction reads.
         """
         entries: list[dict] = []
         skipped_no_reads = 0
         skipped_low_complexity = 0
+        skipped_no_th = 0
 
         with open(summary_tsv) as fh:
             reader = csv.DictReader(fh, delimiter="\t")
@@ -106,6 +109,11 @@ class ISFormatter:
                     skipped_low_complexity += 1
                     continue
 
+                n_th = int(row.get("n_tail_head_reads", 0))
+                if self.require_th_reads and n_th == 0:
+                    skipped_no_th += 1
+                    continue
+
                 entries.append({
                     "is_uuid": row["is_uuid"],
                     "chrom": row["chrom"],
@@ -115,17 +123,26 @@ class ISFormatter:
                     "subfamily": row.get("subfamily", "NA"),
                     "consensus_length": int(row.get("consensus_length", 0)),
                     "consensus": consensus,
-                    "n_tail_head_reads": int(row.get("n_tail_head_reads", 0)),
+                    "n_tail_head_reads": n_th,
                     "n_genome_head_reads": int(row.get("n_genome_head_reads", 0)),
                     "n_tail_genome_reads": int(row.get("n_tail_genome_reads", 0)),
                     "n_total_mapped": n_total,
+                    "example_th_read": row.get("example_th_read", ""),
                 })
 
-        total_rows = entries.__len__() + skipped_no_reads + skipped_low_complexity
+        total_rows = (
+            len(entries) + skipped_no_reads
+            + skipped_low_complexity + skipped_no_th
+        )
+        skip_parts = [
+            f"{skipped_no_reads} no-reads",
+            f"{skipped_low_complexity} low-complexity",
+        ]
+        if skipped_no_th:
+            skip_parts.append(f"{skipped_no_th} no-TH-junction")
         logger.info(
             f"Loaded {len(entries)}/{total_rows} IS elements from "
-            f"{summary_tsv.name} (skipped {skipped_no_reads} no-reads, "
-            f"{skipped_low_complexity} low-complexity)"
+            f"{summary_tsv.name} (skipped {', '.join(skip_parts)})"
         )
         return entries
 
@@ -431,13 +448,14 @@ class ISFormatter:
         is_seq: str,
         upstream: str,
         downstream: str,
-        organism: str,
+        sample_id: str,
         assembly_method: str,
     ) -> dict:
         """Build ISExtractor-compatible record dict."""
         return {
             "is_id": is_info["is_uuid"],
-            "organism": organism,
+            "sample_id": sample_id,
+            "organism": "",
             "is_element": {
                 "sequence": is_seq,
                 "length": len(is_seq),
@@ -463,6 +481,7 @@ class ISFormatter:
                 "n_tail_head_reads": is_info["n_tail_head_reads"],
                 "n_genome_head_reads": is_info["n_genome_head_reads"],
                 "n_tail_genome_reads": is_info["n_tail_genome_reads"],
+                "example_th_read": is_info.get("example_th_read", ""),
             },
             "assembly_method": assembly_method,
         }
@@ -471,55 +490,61 @@ class ISFormatter:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_organism(
+    def run_sample(
         self,
         circle_dir: Path,
-        organism: str,
+        sample_id: str,
     ) -> Optional[Path]:
-        """Run IS formatting for one organism's circle detection output.
+        """Run IS formatting for one sample's circle detection output.
 
         Args:
-            circle_dir: Path to the organism's circle output directory
+            circle_dir: Path to the sample's circle output directory
                 (contains *_circle_summary.tsv and *.circle.sorted.bam).
-            organism: Organism name (for output naming and record metadata).
+            sample_id: Sample accession.
 
         Returns:
             Path to output directory containing JSON/TSV, or None on failure.
         """
         circle_dir = Path(circle_dir)
-        slug = slugify(organism)
 
         # 1. Find and load circle summary
-        summary_files = list(circle_dir.glob("*_circle_summary.tsv"))
-        if not summary_files:
-            logger.warning(
-                f"No circle summary TSV found in {circle_dir}, skipping"
-            )
-            return None
+        summary_tsv = circle_dir / f"{sample_id}_circle_summary.tsv"
+        if not summary_tsv.exists():
+            # Fall back to glob for legacy layouts
+            summary_files = list(circle_dir.glob("*_circle_summary.tsv"))
+            if not summary_files:
+                logger.warning(
+                    f"No circle summary TSV found in {circle_dir}, skipping"
+                )
+                return None
+            summary_tsv = summary_files[0]
 
-        summary_tsv = summary_files[0]
         is_entries = self._load_circle_summary(summary_tsv)
         if not is_entries:
             logger.warning(
-                f"No IS elements with reads for {organism}, skipping"
+                f"No IS elements with reads for {sample_id}, skipping"
             )
             return None
 
         # 2. Discover BAMs
-        bam_paths = sorted(circle_dir.glob("*.circle.sorted.bam"))
+        bam_path = circle_dir / f"{sample_id}.circle.sorted.bam"
+        if bam_path.exists():
+            bam_paths = [bam_path]
+        else:
+            bam_paths = sorted(circle_dir.glob("*.circle.sorted.bam"))
         if not bam_paths:
             logger.warning(f"No circle BAMs found in {circle_dir}, skipping")
             return None
 
         logger.info(
-            f"Formatting {len(is_entries)} IS elements for {organism} "
+            f"Formatting {len(is_entries)} IS elements for {sample_id} "
             f"using {len(bam_paths)} BAM(s)"
         )
 
         # 3. Set up output directory
-        org_out = self.output_dir / slug
-        org_out.mkdir(parents=True, exist_ok=True)
-        assembly_dir = org_out / "assembly"
+        sample_out = self.output_dir / sample_id
+        sample_out.mkdir(parents=True, exist_ok=True)
+        assembly_dir = sample_out / "assembly"
         assembly_dir.mkdir(parents=True, exist_ok=True)
 
         # 4. Extract all reads from BAMs in a single pass, grouped by UUID
@@ -592,21 +617,21 @@ class ISFormatter:
 
             record = self._format_record(
                 is_info, is_seq, upstream, downstream,
-                organism, assembly_method,
+                sample_id, assembly_method,
             )
             records.append(record)
 
         # 6. Write outputs
         if not records:
-            logger.warning(f"No IS records produced for {organism}")
+            logger.warning(f"No IS records produced for {sample_id}")
             return None
 
-        json_path = org_out / f"{slug}_is_records.json"
+        json_path = sample_out / f"{sample_id}_is_records.json"
         with open(json_path, "w") as fh:
             json.dump(records, fh, indent=2)
         logger.info(f"Wrote {len(records)} records to {json_path}")
 
-        tsv_path = org_out / f"{slug}_is_records.tsv"
+        tsv_path = sample_out / f"{sample_id}_is_records.tsv"
         _write_tsv(tsv_path, records)
         logger.info(f"Wrote {len(records)} rows to {tsv_path}")
 
@@ -617,96 +642,94 @@ class ISFormatter:
             by_method[m] = by_method.get(m, 0) + 1
         method_str = ", ".join(f"{k}={v}" for k, v in sorted(by_method.items()))
         logger.info(
-            f"IS formatting for {organism}: {len(records)} records ({method_str})"
+            f"IS formatting for {sample_id}: {len(records)} records ({method_str})"
         )
 
-        return org_out
+        return sample_out
 
     def run_batch(
         self,
         circle_results: dict[str, Optional[Path]],
-        metadata,
         parallel: int = 1,
     ) -> dict[str, Optional[Path]]:
-        """Run IS formatting for all organism groups.
+        """Run IS formatting for all samples.
 
         Args:
-            circle_results: Organism -> circle output directory mapping.
-            metadata: DataFrame with organism column (used for organism names).
-            parallel: Number of organisms to process in parallel.
+            circle_results: sample_id -> circle output directory mapping.
+            parallel: Number of samples to process in parallel.
 
         Returns:
-            Dict mapping organism -> formatter output directory (or None).
+            Dict mapping sample_id -> formatter output directory (or None).
         """
         results: dict[str, Optional[Path]] = {}
 
         # Collect tasks
         tasks: list[tuple[str, Path]] = []
-        for organism, circle_dir in circle_results.items():
+        for sample_id, circle_dir in circle_results.items():
             if not circle_dir:
-                results[organism] = None
+                results[sample_id] = None
                 continue
             circle_dir = Path(circle_dir)
             if not circle_dir.exists():
                 logger.warning(
-                    f"Circle dir does not exist for {organism}: {circle_dir}"
+                    f"Circle dir does not exist for {sample_id}: {circle_dir}"
                 )
-                results[organism] = None
+                results[sample_id] = None
                 continue
-            tasks.append((organism, circle_dir))
+            tasks.append((sample_id, circle_dir))
 
-        logger.info(f"Running IS formatting for {len(tasks)} organism groups")
+        logger.info(f"Running IS formatting for {len(tasks)} samples")
 
         if parallel <= 1:
-            for organism, circle_dir in tasks:
+            for sample_id, circle_dir in tasks:
                 try:
-                    out = self.run_organism(
+                    out = self.run_sample(
                         circle_dir=circle_dir,
-                        organism=organism,
+                        sample_id=sample_id,
                     )
-                    results[organism] = out
+                    results[sample_id] = out
                 except Exception as exc:
                     logger.error(
-                        f"IS formatting failed for {organism}, skipping: {exc}"
+                        f"IS formatting failed for {sample_id}, skipping: {exc}"
                     )
-                    results[organism] = None
+                    results[sample_id] = None
         else:
             logger.info(
-                f"Running {len(tasks)} organisms with {parallel} in parallel"
+                f"Running {len(tasks)} samples with {parallel} in parallel"
             )
             with ProcessPoolExecutor(max_workers=parallel) as pool:
                 futures = {}
-                for organism, circle_dir in tasks:
+                for sample_id, circle_dir in tasks:
                     fut = pool.submit(
                         _run_formatter_worker,
-                        organism=organism,
+                        sample_id=sample_id,
                         circle_dir=circle_dir,
                         output_dir=self.output_dir,
                         flank_size=self.flank_size,
                         min_reads=self.min_reads,
                         assembly_timeout=self.assembly_timeout,
                         min_entropy=self.min_entropy,
+                        require_th_reads=self.require_th_reads,
                         threads=self.threads,
                     )
-                    futures[fut] = organism
+                    futures[fut] = sample_id
 
                 for fut in as_completed(futures):
-                    organism = futures[fut]
+                    sample_id = futures[fut]
                     try:
                         out = fut.result()
-                        results[organism] = out
+                        results[sample_id] = out
                         if out:
                             logger.info(f"  -> {out}")
                     except Exception as exc:
                         logger.error(
-                            f"IS formatter worker failed for {organism}: {exc}"
+                            f"IS formatter worker failed for {sample_id}: {exc}"
                         )
-                        results[organism] = None
+                        results[sample_id] = None
 
         ok = sum(1 for v in results.values() if v)
         logger.info(
-            f"IS formatting complete: {ok}/{len(results)} organism groups "
-            f"processed"
+            f"IS formatting complete: {ok}/{len(results)} samples processed"
         )
         return results
 
@@ -716,13 +739,14 @@ class ISFormatter:
 # ------------------------------------------------------------------
 
 def _run_formatter_worker(
-    organism: str,
+    sample_id: str,
     circle_dir: Path,
     output_dir: Path,
     flank_size: int,
     min_reads: int,
     assembly_timeout: int,
     min_entropy: float,
+    require_th_reads: bool,
     threads: int,
 ) -> Optional[Path]:
     """Standalone worker function for parallel IS formatting."""
@@ -732,22 +756,24 @@ def _run_formatter_worker(
         min_reads=min_reads,
         assembly_timeout=assembly_timeout,
         min_entropy=min_entropy,
+        require_th_reads=require_th_reads,
         threads=threads,
     )
-    return formatter.run_organism(
+    return formatter.run_sample(
         circle_dir=circle_dir,
-        organism=organism,
+        sample_id=sample_id,
     )
 
 
 def _write_tsv(path: Path, records: list[dict]) -> None:
     """Flatten ISExtractor-compatible records to TSV."""
     columns = [
-        "is_id", "organism", "is_sequence", "is_length",
+        "is_id", "sample_id", "is_sequence", "is_length",
         "contig", "start", "end", "strand",
         "upstream_seq", "upstream_len",
         "downstream_seq", "downstream_len",
         "n_th_reads", "n_gh_reads", "n_tg_reads",
+        "example_th_seq",
         "assembly_method",
     ]
 
@@ -755,7 +781,7 @@ def _write_tsv(path: Path, records: list[dict]) -> None:
     for rec in records:
         rows.append({
             "is_id": rec["is_id"],
-            "organism": rec["organism"],
+            "sample_id": rec["sample_id"],
             "is_sequence": rec["is_element"]["sequence"],
             "is_length": rec["is_element"]["length"],
             "contig": rec["is_element"]["contig"],
@@ -769,6 +795,7 @@ def _write_tsv(path: Path, records: list[dict]) -> None:
             "n_th_reads": rec["circle_evidence"]["n_tail_head_reads"],
             "n_gh_reads": rec["circle_evidence"]["n_genome_head_reads"],
             "n_tg_reads": rec["circle_evidence"]["n_tail_genome_reads"],
+            "example_th_seq": rec["circle_evidence"]["example_th_read"],
             "assembly_method": rec["assembly_method"],
         })
 

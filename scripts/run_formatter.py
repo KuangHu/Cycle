@@ -3,8 +3,8 @@
 
 Usage:
     python scripts/run_formatter.py \
-      --circle-dir /path/to/circle_output/organism_slug \
-      --organism "Organism name" \
+      --circle-dir /path/to/circle_output/sample_id \
+      --sample-id SRR12345678 \
       --outdir /tmp/test_format \
       --flank-size 80
 """
@@ -32,12 +32,12 @@ def parse_args():
     )
     parser.add_argument(
         "--circle-dir", required=True,
-        help="Path to the organism's circle detection output directory "
+        help="Path to the sample's circle detection output directory "
              "(contains *_circle_summary.tsv and *.circle.sorted.bam).",
     )
     parser.add_argument(
-        "--organism", required=True,
-        help="Organism name (used for output naming).",
+        "--sample-id", required=True,
+        help="Sample accession (used for output naming).",
     )
     parser.add_argument(
         "--outdir", default=DEFAULT_FORMATTER_OUTPUT_DIR,
@@ -58,6 +58,12 @@ def parse_args():
     parser.add_argument(
         "--threads", type=int, default=4,
         help="Threads for minimap2/minipolish. Default: 4",
+    )
+    parser.add_argument(
+        "--no-require-th", action="store_true",
+        help="Process all IS elements with mapped reads, not just those with "
+             "tail-head junction reads. By default only TH-positive elements "
+             "are assembled (much faster).",
     )
     return parser.parse_args()
 
@@ -80,12 +86,13 @@ def main():
         flank_size=args.flank_size,
         min_reads=args.min_reads,
         assembly_timeout=args.assembly_timeout,
+        require_th_reads=not args.no_require_th,
         threads=args.threads,
     )
 
-    result = formatter.run_organism(
+    result = formatter.run_sample(
         circle_dir=circle_dir,
-        organism=args.organism,
+        sample_id=args.sample_id,
     )
 
     if result:
