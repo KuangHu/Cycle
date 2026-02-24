@@ -1,14 +1,10 @@
 """Detect IS circular intermediates and insertion boundaries via bait mapping.
 
-For each IS consensus from tldr, two bait sequences are built:
-
-1. **Concatemer bait** ``[IS][IS]`` — reads from circular intermediates map
-   across the tail-head junction (center seam).
-2. **Insertion-context bait** ``[upstream_flank][IS][downstream_flank]`` — reads
-   spanning the genome-head or tail-genome junctions confirm genomic integration.
-
-Both baits are combined into a single FASTA per sample so each FASTQ is
-mapped only once.
+For each IS consensus from tldr, a concatemer bait ``[IS][IS]`` is built.
+Reads from circular intermediates map across the tail-head junction at the
+center seam.  Genome-head and tail-genome junctions are detected via
+soft-clip analysis on reads aligned near IS copy boundaries within the
+same bait — no reference genome flanking sequence is needed.
 """
 
 import csv
@@ -26,8 +22,8 @@ import pysam
 
 from ..utils import find_fastq
 from .config import (
+    DEFAULT_BOUNDARY_TOLERANCE,
     DEFAULT_CIRCLE_OUTPUT_DIR,
-    DEFAULT_FLANK_LENGTH,
     DEFAULT_MIN_CONSENSUS_ENTROPY,
     DEFAULT_MIN_CONSENSUS_LENGTH,
     DEFAULT_MIN_JUNCTION_OVERLAP,
@@ -52,11 +48,10 @@ class ISEntry:
 class CircleFinder:
     """Detect IS circular intermediates and insertion boundaries via bait mapping.
 
-    For each sample, bait sequences are built for all IS elements from
-    tldr/sniffles: concatemer baits for tail-head junctions and (when a
-    reference genome is provided) insertion-context baits for genome-head and
-    tail-genome junctions.  The sample's FASTQ is mapped once against the
-    combined bait FASTA.
+    For each sample, concatemer bait ``[IS][IS]`` sequences are built for all
+    IS elements from tldr/sniffles.  Tail-head junctions are detected by reads
+    spanning the center seam.  Genome-head and tail-genome junctions are
+    detected via soft-clip analysis on reads aligned near IS copy boundaries.
     """
 
     def __init__(
@@ -64,16 +59,17 @@ class CircleFinder:
         output_dir: str = DEFAULT_CIRCLE_OUTPUT_DIR,
         min_overlap: int = DEFAULT_MIN_JUNCTION_OVERLAP,
         min_consensus_length: int = DEFAULT_MIN_CONSENSUS_LENGTH,
-        flank_length: int = DEFAULT_FLANK_LENGTH,
+        boundary_tolerance: int = DEFAULT_BOUNDARY_TOLERANCE,
         min_consensus_entropy: float = DEFAULT_MIN_CONSENSUS_ENTROPY,
         threads: int = 8,
         sort_memory: str = "4G",
+        flank_length: int | None = None,  # deprecated, ignored
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.min_overlap = min_overlap
         self.min_consensus_length = min_consensus_length
-        self.flank_length = flank_length
+        self.boundary_tolerance = boundary_tolerance
         self.min_consensus_entropy = min_consensus_entropy
         self.threads = threads
         self.sort_memory = sort_memory
@@ -136,59 +132,16 @@ class CircleFinder:
         )
         return entries
 
-    def _extract_flanking_sequence(
-        self, entry: ISEntry, fa: pysam.FastaFile,
-    ) -> tuple[str, str] | None:
-        """Extract upstream and downstream genomic flanks around an IS insertion.
-
-        Uses ``pysam.FastaFile`` to fetch sequence from the reference genome.
-        Handles edge cases: IS near contig boundary (clamp), contig not in
-        reference (skip), flank shorter than ``min_overlap`` (skip).
-
-        Returns:
-            ``(upstream_seq, downstream_seq)`` or ``None`` if unusable.
-        """
-        if entry.chrom not in fa.references:
-            logger.debug(
-                f"Contig {entry.chrom} not in reference, "
-                f"skipping IC bait for {entry.uuid}"
-            )
-            return None
-
-        contig_length = fa.get_reference_length(entry.chrom)
-
-        start = min(entry.start, entry.end)
-        end = max(entry.start, entry.end)
-        start = max(0, min(start, contig_length))
-        end = max(0, min(end, contig_length))
-
-        up_start = max(0, start - self.flank_length)
-        down_end = min(contig_length, end + self.flank_length)
-
-        upstream = fa.fetch(entry.chrom, up_start, start)
-        downstream = fa.fetch(entry.chrom, end, down_end)
-
-        if len(upstream) < self.min_overlap or len(downstream) < self.min_overlap:
-            logger.debug(
-                f"Flanks too short for {entry.uuid}: "
-                f"upstream={len(upstream)}, downstream={len(downstream)}"
-            )
-            return None
-
-        return upstream, downstream
-
     def _build_bait_fasta(
         self,
         entries: list[ISEntry],
         output_path: Path,
-        ref_fasta_path: Path | None = None,
     ) -> tuple[Path, dict[str, list[dict]]]:
-        """Write combined bait FASTA (concatemer + insertion-context).
+        """Write concatemer bait FASTA ``[IS][IS]`` for each IS element.
 
-        Header formats::
+        Header format::
 
-            >{uuid}__th__j{N}                        # tail-head bait
-            >{uuid}__ic__j{J1}_j{J2}__fl{FLANK}     # insertion-context bait
+            >{uuid}__th__j{N}
 
         Returns:
             ``(fasta_path, junction_map)`` where *junction_map* maps
@@ -201,20 +154,10 @@ class CircleFinder:
 
         junction_map: dict[str, list[dict]] = {}
 
-        fa = None
-        if ref_fasta_path and Path(ref_fasta_path).exists():
-            try:
-                fa = pysam.FastaFile(str(ref_fasta_path))
-            except Exception as exc:
-                logger.warning(
-                    f"Could not open reference FASTA {ref_fasta_path}: {exc}"
-                )
-
         with open(output_path, "w") as fh:
             for entry in entries:
                 n = len(entry.consensus)
 
-                # Tail-head bait (concatemer)
                 th_name = f"{entry.uuid}__th__j{n}"
                 fh.write(f">{th_name}\n")
                 fh.write(f"{entry.consensus}{entry.consensus}\n")
@@ -222,31 +165,8 @@ class CircleFinder:
                     {"type": "tail_head", "position": n, "uuid": entry.uuid},
                 ]
 
-                # Insertion-context bait (when reference available)
-                if fa is not None:
-                    flanks = self._extract_flanking_sequence(entry, fa)
-                    if flanks is not None:
-                        upstream, downstream = flanks
-                        j1 = len(upstream)
-                        j2 = len(upstream) + n
-                        ic_name = (
-                            f"{entry.uuid}__ic__j{j1}_j{j2}"
-                            f"__fl{self.flank_length}"
-                        )
-                        fh.write(f">{ic_name}\n")
-                        fh.write(f"{upstream}{entry.consensus}{downstream}\n")
-                        junction_map[ic_name] = [
-                            {"type": "genome_head", "position": j1, "uuid": entry.uuid},
-                            {"type": "tail_genome", "position": j2, "uuid": entry.uuid},
-                        ]
-
-        if fa is not None:
-            fa.close()
-
-        n_th = sum(1 for k in junction_map if "__th__" in k)
-        n_ic = sum(1 for k in junction_map if "__ic__" in k)
         logger.info(
-            f"Wrote bait FASTA with {n_th} tail-head + {n_ic} insertion-context "
+            f"Wrote bait FASTA with {len(junction_map)} tail-head "
             f"sequences to {output_path}"
         )
         return output_path, junction_map
@@ -254,8 +174,8 @@ class CircleFinder:
     def _parse_bait_headers(self, fasta_path: Path) -> dict[str, list[dict]]:
         """Reconstruct junction_map from existing bait FASTA headers.
 
-        Handles current ``__th__`` / ``__ic__`` formats as well as the legacy
-        ``__len{N}`` format for backward compatibility.
+        Handles current ``__th__`` format as well as the legacy ``__len{N}``
+        format for backward compatibility.  Old ``__ic__`` headers are ignored.
         """
         junction_map: dict[str, list[dict]] = {}
 
@@ -271,16 +191,6 @@ class CircleFinder:
                     junction_pos = int(parts[1])
                     junction_map[ref_name] = [
                         {"type": "tail_head", "position": junction_pos, "uuid": uuid},
-                    ]
-
-                elif "__ic__j" in ref_name:
-                    uuid = ref_name.split("__ic__")[0]
-                    jpart = ref_name.split("__ic__j")[1].split("__fl")[0]
-                    j1_str, j2_str = jpart.split("_j")
-                    j1, j2 = int(j1_str), int(j2_str)
-                    junction_map[ref_name] = [
-                        {"type": "genome_head", "position": j1, "uuid": uuid},
-                        {"type": "tail_genome", "position": j2, "uuid": uuid},
                     ]
 
                 elif "__len" in ref_name:
@@ -374,10 +284,14 @@ class CircleFinder:
     ) -> tuple[list[dict], dict[str, dict]]:
         """Scan BAM for reads spanning bait junctions.
 
-        Checks all junction types (tail_head, genome_head, tail_genome) for
-        each aligned read.  A read is junction-spanning if its alignment starts
-        at or before ``junction - min_overlap`` and ends at or after
-        ``junction + min_overlap``.
+        **Tail-head**: read alignment spans the junction at position N
+        (center of ``[IS][IS]`` bait) by at least ``min_overlap`` on each side.
+
+        **Genome-head**: read has a large left soft-clip (genomic) and its
+        alignment starts near an IS copy boundary (0 or N on the TH bait).
+
+        **Tail-genome**: read has a large right soft-clip (genomic) and its
+        alignment ends near an IS copy boundary (N or 2N on the TH bait).
 
         Returns:
             ``(junction_reads, summary_by_uuid)`` where *junction_reads* is a
@@ -389,6 +303,9 @@ class CircleFinder:
         counts: dict[str, dict[str, int]] = {}  # uuid -> {type -> count}
         # uuid -> (mapq, length, sequence) for best tail-head example read
         th_example: dict[str, tuple[int, int, str]] = {}
+
+        tol = self.boundary_tolerance
+        min_overlap = self.min_overlap
 
         bam = pysam.AlignmentFile(str(bam_path), "rb")
         for read in bam.fetch():
@@ -410,50 +327,73 @@ class CircleFinder:
 
             ref_start = read.reference_start   # 0-based
             ref_end = read.reference_end       # 0-based, exclusive
+            aligned_len = ref_end - ref_start
 
-            for junc in junctions:
-                junction_pos = junc["position"]
-                junction_type = junc["type"]
+            # Soft-clip lengths from CIGAR
+            cigar = read.cigartuples
+            left_clip = cigar[0][1] if cigar and cigar[0][0] in (4, 5) else 0
+            right_clip = cigar[-1][1] if cigar and cigar[-1][0] in (4, 5) else 0
 
-                overlap_left = junction_pos - ref_start
-                overlap_right = ref_end - junction_pos
+            # The junction_map for a TH bait has one entry with position = N
+            junction_pos = junctions[0]["position"]
+            n = junction_pos  # IS consensus length
 
-                if (ref_start <= junction_pos - self.min_overlap
-                        and ref_end >= junction_pos + self.min_overlap):
-                    if uuid not in counts:
-                        counts[uuid] = {}
-                    counts[uuid][junction_type] = (
-                        counts[uuid].get(junction_type, 0) + 1
+            detected_types: list[str] = []
+
+            # Tail-head: alignment spans the junction at N
+            if (ref_start <= junction_pos - min_overlap
+                    and ref_end >= junction_pos + min_overlap):
+                detected_types.append("tail_head")
+
+            # Genome-head: left soft-clip is genomic, alignment starts
+            # near an IS copy boundary (position 0 or N)
+            if (left_clip >= min_overlap
+                    and aligned_len >= min_overlap
+                    and (ref_start < tol or abs(ref_start - n) < tol)):
+                detected_types.append("genome_head")
+
+            # Tail-genome: right soft-clip is genomic, alignment ends
+            # near an IS copy boundary (position N or 2N)
+            if (right_clip >= min_overlap
+                    and aligned_len >= min_overlap
+                    and (abs(ref_end - n) < tol or abs(ref_end - 2 * n) < tol)):
+                detected_types.append("tail_genome")
+
+            for junction_type in detected_types:
+                if uuid not in counts:
+                    counts[uuid] = {}
+                counts[uuid][junction_type] = (
+                    counts[uuid].get(junction_type, 0) + 1
+                )
+
+                if (junction_type == "tail_head"
+                        and read.query_sequence):
+                    candidate = (
+                        read.mapping_quality,
+                        len(read.query_sequence),
+                        read.query_sequence,
                     )
+                    if uuid not in th_example or candidate[:2] > th_example[uuid][:2]:
+                        th_example[uuid] = candidate
 
-                    if (junction_type == "tail_head"
-                            and read.query_sequence):
-                        candidate = (
-                            read.mapping_quality,
-                            len(read.query_sequence),
-                            read.query_sequence,
-                        )
-                        if uuid not in th_example or candidate[:2] > th_example[uuid][:2]:
-                            th_example[uuid] = candidate
-
-                    junction_reads.append({
-                        "read_id": read.query_name,
-                        "sample_id": sample_id,
-                        "is_uuid": uuid,
-                        "junction_type": junction_type,
-                        "chrom": entry.chrom,
-                        "start": entry.start,
-                        "end": entry.end,
-                        "family": entry.family,
-                        "subfamily": entry.subfamily,
-                        "read_length": read.query_length,
-                        "alignment_start": ref_start,
-                        "alignment_end": ref_end,
-                        "junction_pos": junction_pos,
-                        "overlap_left": overlap_left,
-                        "overlap_right": overlap_right,
-                        "mapping_quality": read.mapping_quality,
-                    })
+                junction_reads.append({
+                    "read_id": read.query_name,
+                    "sample_id": sample_id,
+                    "is_uuid": uuid,
+                    "junction_type": junction_type,
+                    "chrom": entry.chrom,
+                    "start": entry.start,
+                    "end": entry.end,
+                    "family": entry.family,
+                    "subfamily": entry.subfamily,
+                    "read_length": read.query_length,
+                    "alignment_start": ref_start,
+                    "alignment_end": ref_end,
+                    "junction_pos": junction_pos,
+                    "overlap_left": junction_pos - ref_start,
+                    "overlap_right": ref_end - junction_pos,
+                    "mapping_quality": read.mapping_quality,
+                })
 
         bam.close()
 
@@ -496,8 +436,7 @@ class CircleFinder:
             tldr_table: Path to the tldr/sniffles .table.txt for this sample.
             sample_id: Sample accession.
             fastq_path: Path to the sample's FASTQ file.
-            ref_fasta: Optional reference genome FASTA for insertion-context
-                baits.  When ``None``, only tail-head junctions are detected.
+            ref_fasta: Accepted for backward compatibility but ignored.
 
         Returns:
             Path to the sample output directory, or ``None`` on failure.
@@ -515,11 +454,9 @@ class CircleFinder:
 
         entries_by_uuid = {e.uuid: e for e in entries}
 
-        # 2. Build bait FASTA (concatemer + insertion-context)
+        # 2. Build bait FASTA (concatemer)
         bait_path = sample_dir / f"{sample_id}_bait.fa"
-        bait_path, junction_map = self._build_bait_fasta(
-            entries, bait_path, ref_fasta,
-        )
+        bait_path, junction_map = self._build_bait_fasta(entries, bait_path)
 
         # 3. Map FASTQ and collect junction reads
         bam_path = sample_dir / f"{sample_id}.circle.sorted.bam"
@@ -581,9 +518,7 @@ class CircleFinder:
             metadata: DataFrame with accession column.
             fastq_dir: Directory containing FASTQ files.
             accession_col: Column name for SRR accession.
-            ref_map: Optional sample_id -> ref_fasta path.  When provided,
-                insertion-context baits are built for genome-head and
-                tail-genome junction detection.
+            ref_map: Accepted for backward compatibility but ignored.
             parallel: Number of samples to process in parallel.
 
         Returns:
@@ -649,7 +584,7 @@ class CircleFinder:
                         sort_memory=self.sort_memory,
                         min_overlap=self.min_overlap,
                         min_consensus_length=self.min_consensus_length,
-                        flank_length=self.flank_length,
+                        boundary_tolerance=self.boundary_tolerance,
                         min_consensus_entropy=self.min_consensus_entropy,
                     )
                     futures[fut] = sid
@@ -684,8 +619,9 @@ def _run_circle_worker(
     sort_memory: str,
     min_overlap: int,
     min_consensus_length: int,
-    flank_length: int,
+    boundary_tolerance: int = DEFAULT_BOUNDARY_TOLERANCE,
     min_consensus_entropy: float = DEFAULT_MIN_CONSENSUS_ENTROPY,
+    flank_length: int | None = None,  # deprecated, ignored
 ) -> Optional[Path]:
     """Standalone worker function for parallel circle detection."""
     finder = CircleFinder(
@@ -694,7 +630,7 @@ def _run_circle_worker(
         sort_memory=sort_memory,
         min_overlap=min_overlap,
         min_consensus_length=min_consensus_length,
-        flank_length=flank_length,
+        boundary_tolerance=boundary_tolerance,
         min_consensus_entropy=min_consensus_entropy,
     )
     return finder.run_sample(

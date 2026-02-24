@@ -43,7 +43,6 @@ from cycle.preprocess.config import (
 from cycle.circle_detect import CircleFinder
 from cycle.circle_detect.config import (
     DEFAULT_CIRCLE_OUTPUT_DIR,
-    DEFAULT_FLANK_LENGTH,
     DEFAULT_MIN_JUNCTION_OVERLAP,
 )
 from cycle.is_formatter import ISFormatter
@@ -141,10 +140,6 @@ def parse_args():
     parser.add_argument(
         "--min-overlap", type=int, default=DEFAULT_MIN_JUNCTION_OVERLAP,
         help=f"Min bp overlap on each side of junction. Default: {DEFAULT_MIN_JUNCTION_OVERLAP}",
-    )
-    parser.add_argument(
-        "--flank-length", type=int, default=DEFAULT_FLANK_LENGTH,
-        help=f"Genomic flank length (bp) for insertion-context baits. Default: {DEFAULT_FLANK_LENGTH}",
     )
     parser.add_argument(
         "--formatter-dir", default=None,
@@ -591,7 +586,6 @@ def main():
         finder = CircleFinder(
             output_dir=args.circle_dir,
             min_overlap=args.min_overlap,
-            flank_length=args.flank_length,
             threads=args.threads,
             sort_memory=args.sort_memory,
         )
