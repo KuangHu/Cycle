@@ -1,4 +1,4 @@
-"""Run tldr per organism group to detect transposon insertions."""
+"""Run tldr per sample to detect transposon insertions."""
 
 import logging
 import shutil
@@ -9,18 +9,13 @@ from typing import Optional
 
 import pandas as pd
 
-from ..utils import slugify as _slugify
 from .config import DEFAULT_ALIGNMENT_DIR, DEFAULT_TLDR_OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
 
 
 class TldrRunner:
-    """Run tldr once per organism group.
-
-    tldr requires all BAMs in a single invocation to share the same
-    reference genome, so samples are grouped by organism before calling.
-    """
+    """Run tldr once per sample."""
 
     def __init__(
         self,
@@ -34,63 +29,60 @@ class TldrRunner:
         if not shutil.which("tldr"):
             raise RuntimeError("tldr not found in PATH")
 
-    def run_organism_group(
+    def run_sample(
         self,
-        bams: list[Path],
+        bam: Path,
         ref_fasta: Path,
         is_ref: Path,
-        organism: str,
+        sample_id: str,
         procs: int = 8,
     ) -> Optional[Path]:
-        """Run tldr on a group of BAMs sharing the same reference genome.
+        """Run tldr on a single BAM for one sample.
 
         Args:
-            bams: Sorted BAM files (all aligned to the same reference).
+            bam: Sorted BAM file.
             ref_fasta: Reference genome FASTA used for alignment.
             is_ref: tldr-formatted IS element reference FASTA.
-            organism: Organism name (used for output directory naming).
+            sample_id: Sample accession (used for output directory naming).
             procs: Number of processes for tldr.
 
         Returns:
             Path to the tldr output table, or None on failure.
         """
-        slug = _slugify(organism)
-        org_dir = self.output_dir / slug
-        org_dir.mkdir(parents=True, exist_ok=True)
+        sample_dir = self.output_dir / sample_id
+        sample_dir.mkdir(parents=True, exist_ok=True)
 
-        output_prefix = org_dir / slug
+        output_prefix = sample_dir / sample_id
         table_path = Path(f"{output_prefix}.table.txt")
 
         if table_path.exists():
-            logger.info(f"tldr output exists for {organism}: {table_path}")
+            logger.info(f"tldr output exists for {sample_id}: {table_path}")
             return table_path
 
         cmd = [
             "tldr",
-            "-b", ",".join(str(b) for b in bams),
+            "-b", str(bam),
             "-e", str(is_ref),
             "-r", str(ref_fasta),
             "-p", str(procs),
             "-o", str(output_prefix),
         ]
 
-        logger.info(
-            f"Running tldr for {organism} ({len(bams)} BAMs): {slug}"
-        )
+        logger.info(f"Running tldr for {sample_id}: {bam.name}")
         logger.debug(f"  cmd: {' '.join(cmd)}")
 
         try:
             ret = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=7200,
-                cwd=str(org_dir),
+                cwd=str(sample_dir),
             )
         except subprocess.TimeoutExpired:
-            logger.error(f"tldr timed out for {organism}")
+            logger.error(f"tldr timed out for {sample_id}")
             return None
 
         if ret.returncode != 0:
             logger.error(
-                f"tldr failed for {organism} (rc={ret.returncode}): "
+                f"tldr failed for {sample_id} (rc={ret.returncode}): "
                 f"{ret.stderr.strip()[:500]}"
             )
             return None
@@ -105,114 +97,99 @@ class TldrRunner:
     def run_batch(
         self,
         metadata: pd.DataFrame,
-        ref_map: dict[str, dict],
+        ref_map: dict[str, Path],
         is_ref: Path,
         procs: int = 8,
         parallel: int = 1,
-        organism_col: str = "organism",
         accession_col: str = "srr_accession",
     ) -> dict[str, Optional[Path]]:
-        """Group samples by organism and run tldr for each group.
+        """Run tldr for each sample.
 
         Args:
-            metadata: DataFrame with organism and accession columns.
-            ref_map: Organism -> {accession, fasta, fai} from resolve step.
+            metadata: DataFrame with accession column.
+            ref_map: sample_id -> ref_fasta path.
             is_ref: Path to IS element reference FASTA.
             procs: Number of processes per tldr invocation.
-            parallel: Number of organisms to run in parallel.
-            organism_col: Column name for organism.
+            parallel: Number of samples to run in parallel.
             accession_col: Column name for SRR accession.
 
         Returns:
-            Dict mapping organism -> tldr table path (or None).
+            Dict mapping sample_id -> tldr table path (or None).
         """
         results: dict[str, Optional[Path]] = {}
-        groups = metadata.groupby(organism_col)
-
-        logger.info(f"Running tldr for {len(groups)} organism groups")
 
         # Build task list
-        tasks: list[tuple[str, list[Path], Path]] = []
-        for organism, group_df in groups:
-            ref_info = ref_map.get(organism)
-            if not ref_info:
-                logger.warning(f"No reference for {organism}, skipping tldr")
-                results[organism] = None
+        tasks: list[tuple[str, Path, Path]] = []
+        for _, row in metadata.iterrows():
+            sid = row[accession_col]
+            ref_fasta = ref_map.get(sid)
+            if not ref_fasta:
+                logger.warning(f"No reference for {sid}, skipping tldr")
+                results[sid] = None
                 continue
 
-            ref_fasta = Path(ref_info["fasta"])
-
-            bams = []
-            for _, row in group_df.iterrows():
-                sid = row[accession_col]
-                bam = self.alignment_dir / f"{sid}.sorted.bam"
-                if bam.exists():
-                    bams.append(bam)
-                else:
-                    logger.warning(f"BAM not found for {sid}: {bam}")
-
-            if not bams:
-                logger.warning(f"No BAMs found for {organism}, skipping")
-                results[organism] = None
+            bam = self.alignment_dir / f"{sid}.sorted.bam"
+            if not bam.exists():
+                logger.warning(f"BAM not found for {sid}: {bam}")
+                results[sid] = None
                 continue
 
-            tasks.append((organism, bams, ref_fasta))
+            tasks.append((sid, bam, ref_fasta))
+
+        logger.info(f"Running tldr for {len(tasks)} samples")
 
         if parallel <= 1:
-            # Sequential (original behavior)
-            for organism, bams, ref_fasta in tasks:
-                table = self.run_organism_group(
-                    bams=bams, ref_fasta=ref_fasta, is_ref=is_ref,
-                    organism=organism, procs=procs,
+            for sid, bam, ref_fasta in tasks:
+                table = self.run_sample(
+                    bam=bam, ref_fasta=ref_fasta, is_ref=is_ref,
+                    sample_id=sid, procs=procs,
                 )
-                results[organism] = table
+                results[sid] = table
         else:
-            # Parallel execution across organisms
-            logger.info(f"Running {len(tasks)} organisms with {parallel} in parallel, {procs} procs each")
+            logger.info(f"Running {len(tasks)} samples with {parallel} in parallel, {procs} procs each")
             with ProcessPoolExecutor(max_workers=parallel) as pool:
                 futures = {}
-                for organism, bams, ref_fasta in tasks:
+                for sid, bam, ref_fasta in tasks:
                     fut = pool.submit(
                         _run_tldr_worker,
-                        bams=bams,
+                        bam=bam,
                         ref_fasta=ref_fasta,
                         is_ref=is_ref,
-                        organism=organism,
+                        sample_id=sid,
                         procs=procs,
                         output_dir=self.output_dir,
                     )
-                    futures[fut] = organism
+                    futures[fut] = sid
 
                 for fut in as_completed(futures):
-                    organism = futures[fut]
+                    sid = futures[fut]
                     try:
                         table = fut.result()
-                        results[organism] = table
+                        results[sid] = table
                         if table:
                             logger.info(f"  -> {table}")
                     except Exception as e:
-                        logger.error(f"tldr worker failed for {organism}: {e}")
-                        results[organism] = None
+                        logger.error(f"tldr worker failed for {sid}: {e}")
+                        results[sid] = None
 
         ok = sum(1 for v in results.values() if v)
-        logger.info(f"tldr complete: {ok}/{len(results)} organism groups succeeded")
+        logger.info(f"tldr complete: {ok}/{len(results)} samples succeeded")
         return results
 
 
 def _run_tldr_worker(
-    bams: list[Path],
+    bam: Path,
     ref_fasta: Path,
     is_ref: Path,
-    organism: str,
+    sample_id: str,
     procs: int,
     output_dir: Path,
 ) -> Optional[Path]:
     """Standalone worker function for parallel tldr execution."""
-    slug = _slugify(organism)
-    org_dir = output_dir / slug
-    org_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir = output_dir / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
 
-    output_prefix = org_dir / slug
+    output_prefix = sample_dir / sample_id
     table_path = Path(f"{output_prefix}.table.txt")
 
     if table_path.exists():
@@ -220,7 +197,7 @@ def _run_tldr_worker(
 
     cmd = [
         "tldr",
-        "-b", ",".join(str(b) for b in bams),
+        "-b", str(bam),
         "-e", str(is_ref),
         "-r", str(ref_fasta),
         "-p", str(procs),
@@ -230,15 +207,15 @@ def _run_tldr_worker(
     try:
         ret = subprocess.run(
             cmd, capture_output=True, text=True, timeout=7200,
-            cwd=str(org_dir),
+            cwd=str(sample_dir),
         )
     except subprocess.TimeoutExpired:
-        logging.getLogger(__name__).error(f"tldr timed out for {organism}")
+        logging.getLogger(__name__).error(f"tldr timed out for {sample_id}")
         return None
 
     if ret.returncode != 0:
         logging.getLogger(__name__).error(
-            f"tldr failed for {organism} (rc={ret.returncode}): "
+            f"tldr failed for {sample_id} (rc={ret.returncode}): "
             f"{ret.stderr.strip()[:500]}"
         )
         return None

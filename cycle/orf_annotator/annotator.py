@@ -118,7 +118,7 @@ class ORFAnnotator:
         Returns dict mapping sample JSON filename to output path (or None).
         """
         formatter_dir = Path(formatter_dir)
-        json_files = sorted(formatter_dir.glob("**/*_is_records.json"))
+        json_files = sorted(formatter_dir.glob("*/*_is_records.json"))
 
         if not json_files:
             logger.warning(f"No *_is_records.json files in {formatter_dir}")

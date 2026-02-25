@@ -11,7 +11,7 @@
 # Examples:
 #   bash submit_all.sh --step 1 5 94             # Download+resolve+index batches 005-094
 #   bash submit_all.sh --step 2 --dep 1 5 94     # Align after step 1 finishes
-#   bash submit_all.sh --step 3 --dep 2 5 94     # Sniffles+circle after step 2 finishes
+#   bash submit_all.sh --step 3 --dep 2 5 94     # Sniffles+circle+format after step 2 finishes
 
 set -e
 
@@ -135,20 +135,8 @@ python $PREPARE_META '$batch_dir' && \
 python $PIPELINE \
   --metadata '$batch_dir/metadata_for_sniffles.tsv' \
   --outdir '$batch_dir' \
-  --steps sniffles \
-  --sniffles-parallel 6 \
-  --threads 8 && \
-python $PIPELINE \
-  --metadata '$batch_dir/metadata_for_sniffles.tsv' \
-  --outdir '$batch_dir' \
-  --steps circle \
-  --circle-parallel 6 \
-  --threads 8 && \
-python $PIPELINE \
-  --metadata '$batch_dir/metadata_for_sniffles.tsv' \
-  --outdir '$batch_dir' \
-  --steps format \
-  --formatter-parallel 6 \
+  --steps sniffles circle format \
+  --parallel 6 \
   --threads 8"
     fi
 
