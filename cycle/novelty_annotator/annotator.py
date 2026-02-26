@@ -366,6 +366,7 @@ class NoveltyAnnotator:
                 rec["isfinder_annotation"] = {
                     "best_hit_name": None,
                     "best_hit_family": None,
+                    "best_hit_group": None,
                     "pident": None,
                     "query_coverage": None,
                     "evalue": None,
@@ -378,8 +379,14 @@ class NoveltyAnnotator:
                 continue
 
             best = query_hits[0]
+            # Use hit_group as family — ISfinder's "family" field is
+            # often "unknown", while "group" has the real classification
+            # (IS110, IS3, IS6, IS256, etc.)
             all_families = list(
-                dict.fromkeys(h["hit_family"] for h in query_hits if h["hit_family"])
+                dict.fromkeys(
+                    h["hit_group"] for h in query_hits
+                    if h["hit_group"] and h["hit_group"] != "unknown"
+                )
             )
             all_names = list(
                 dict.fromkeys(h["hit_name"] for h in query_hits if h["hit_name"])
@@ -387,7 +394,8 @@ class NoveltyAnnotator:
 
             rec["isfinder_annotation"] = {
                 "best_hit_name": best["hit_name"],
-                "best_hit_family": best["hit_family"],
+                "best_hit_family": best["hit_group"] if best["hit_group"] != "unknown" else best["hit_family"],
+                "best_hit_group": best["hit_group"],
                 "pident": best["pident"],
                 "query_coverage": round(best["query_coverage"], 4),
                 "evalue": best["evalue"],
