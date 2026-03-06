@@ -49,7 +49,11 @@ IS_FAMILY_COLORS = {
     "unclassified": "#cccccc",
 }
 DEFAULT_ORF_COLOR = "#bbbbbb"
+DEDD_COLOR = "#e41a1c"       # red for DEDD domain ORFs
+TNP20_COLOR = "#ff7f00"      # orange for Tnp20 domain ORFs
+DEDD_TNP20_COLOR = "#984ea3" # purple for ORFs with both domains
 NC_COLOR = "#e0e0e0"
+PARTIAL_CIRCLE_COLOR = "#26a69a"  # teal for partial circle regions
 FLANKING_UP_COLOR = "#aed6f1"     # light blue for upstream flanking
 FLANKING_DOWN_COLOR = "#f9e79f"   # light yellow for downstream flanking
 ALIGNMENT_UPSTREAM_COLOR = "#d62728"    # red for upstream flanking hits
@@ -81,6 +85,7 @@ class ISElementVisualizer:
         self,
         element: Dict,
         alignments: List[Dict],
+        partial_circles: Optional[List[Dict]] = None,
     ) -> plt.Figure:
         """Build a dna_features_viewer diagram for one IS element.
 
@@ -90,6 +95,9 @@ class ISElementVisualizer:
         Args:
             element: dict from *_is_records_guide.json.
             alignments: list of guide_hits for this element.
+            partial_circles: optional list of partial circle calls for this element,
+                each with circle_start, circle_end, circle_size, circle_fraction,
+                n_supporting_reads (0-based coords on IS).
 
         Returns:
             matplotlib Figure.
@@ -146,7 +154,7 @@ class ISElementVisualizer:
                 linewidth=0.5,
             ))
 
-        # 2. ORFs — colored directional arrows
+        # 2. ORFs — colored directional arrows (domain-annotated ORFs get distinct colors)
         for i, orf in enumerate(orfs):
             orf_start = offset + orf["start"] - 1  # 1-based to 0-based + offset
             orf_end = offset + orf["end"]
@@ -154,13 +162,27 @@ class ISElementVisualizer:
             length_nt = orf.get("length_nt", orf_end - orf_start)
             length_aa = length_nt // 3
 
-            label = f"orf_{i+1} ({length_aa}aa)"
+            domains = orf.get("domains", [])
+            if "DEDD" in domains and "Tnp20" in domains:
+                color = DEDD_TNP20_COLOR
+                domain_tag = " DEDD+Tnp20"
+            elif "DEDD" in domains:
+                color = DEDD_COLOR
+                domain_tag = " DEDD"
+            elif "Tnp20" in domains:
+                color = TNP20_COLOR
+                domain_tag = " Tnp20"
+            else:
+                color = DEFAULT_ORF_COLOR
+                domain_tag = ""
+
+            label = f"orf_{i+1} ({length_aa}aa){domain_tag}"
 
             features.append(GraphicFeature(
                 start=orf_start,
                 end=orf_end,
                 strand=strand,
-                color=DEFAULT_ORF_COLOR,
+                color=color,
                 label=label,
                 linewidth=1,
             ))
@@ -220,6 +242,25 @@ class ISElementVisualizer:
             flank_mid = (flank_hit_start + flank_hit_end) / 2
             alignment_pairs.append((nc_mid, flank_mid, color))
 
+        # 4. Partial circle regions — teal bands showing circularizing sub-regions
+        if partial_circles:
+            for pc in partial_circles:
+                pc_start = offset + pc["circle_start"]
+                pc_end = offset + pc["circle_end"]
+                n_reads = pc.get("n_supporting_reads", 0)
+                frac = pc.get("circle_fraction", 0)
+                pc_size = pc.get("circle_size", pc_end - pc_start)
+                label = f"circ {pc_size}bp ({frac:.0%}, {n_reads}r)"
+                features.append(GraphicFeature(
+                    start=pc_start,
+                    end=pc_end,
+                    strand=0,
+                    color=PARTIAL_CIRCLE_COLOR,
+                    label=label,
+                    linewidth=1.5,
+                    linecolor=PARTIAL_CIRCLE_COLOR,
+                ))
+
         record = GraphicRecord(sequence_length=total_length, features=features)
         # Cap figure width to avoid matplotlib pixel limit (65535 px max)
         fig_width = max(8, min(300, total_length / 150))
@@ -242,6 +283,16 @@ class ISElementVisualizer:
         ax.axvline(x=offset, color="black", linewidth=1.5, linestyle="--", alpha=0.6)
         ax.axvline(x=offset + is_length, color="black", linewidth=1.5, linestyle="--", alpha=0.6)
 
+        # Draw partial circle boundary lines
+        if partial_circles:
+            for pc in partial_circles:
+                pc_start = offset + pc["circle_start"]
+                pc_end = offset + pc["circle_end"]
+                ax.axvline(x=pc_start, color=PARTIAL_CIRCLE_COLOR, linewidth=1.2,
+                           linestyle=":", alpha=0.7)
+                ax.axvline(x=pc_end, color=PARTIAL_CIRCLE_COLOR, linewidth=1.2,
+                           linestyle=":", alpha=0.7)
+
         fig = ax.figure
         return fig
 
@@ -253,6 +304,7 @@ class ISElementVisualizer:
         dpi: int = 150,
         figure_width: int = 12,
         circle_info: Optional[Dict] = None,
+        partial_circles: Optional[List[Dict]] = None,
     ):
         """Generate and save a PNG diagram for one IS element.
 
@@ -263,8 +315,9 @@ class ISElementVisualizer:
             dpi: resolution.
             figure_width: figure width in inches.
             circle_info: optional dict with circle_evidence fields.
+            partial_circles: optional list of partial circle calls.
         """
-        fig = self.visualize_element(element, alignments)
+        fig = self.visualize_element(element, alignments, partial_circles=partial_circles)
 
         # Build title
         is_id = element.get("is_id", "unknown")

@@ -34,6 +34,7 @@ class ISElementGenBank:
         element: Dict,
         alignments: List[Dict],
         circle_info: Optional[Dict] = None,
+        partial_circles: Optional[List[Dict]] = None,
     ) -> SeqRecord:
         """Build a BioPython SeqRecord for one IS element with annotated features.
 
@@ -44,6 +45,7 @@ class ISElementGenBank:
             element: dict from *_is_records_guide.json.
             alignments: list of guide_hits for this element.
             circle_info: optional dict with circle_evidence fields.
+            partial_circles: optional list of partial circle calls.
 
         Returns:
             Bio.SeqRecord.SeqRecord with features.
@@ -119,7 +121,7 @@ class ISElementGenBank:
                 },
             ))
 
-        # 3. ORFs — CDS
+        # 3. ORFs — CDS (with domain annotations if present)
         for i, orf in enumerate(orfs):
             orf_start = up_len + orf["start"] - 1  # 1-based to 0-based + offset
             orf_end = up_len + orf["end"]
@@ -127,6 +129,7 @@ class ISElementGenBank:
             length_nt = orf.get("length_nt", orf_end - orf_start)
             length_aa = length_nt // 3
             protein_seq = orf.get("protein_sequence", "")
+            domains = orf.get("domains", [])
             orf_id = f"orf_{i+1}"
 
             qualifiers = {
@@ -135,6 +138,9 @@ class ISElementGenBank:
             }
             if protein_seq:
                 qualifiers["translation"] = [protein_seq]
+            if domains:
+                qualifiers["note"] = [f"{length_aa}aa; domains: {','.join(domains)}"]
+                qualifiers["product"] = [",".join(domains)]
 
             features.append(SeqFeature(
                 FeatureLocation(orf_start, orf_end, strand=strand),
@@ -207,6 +213,26 @@ class ISElementGenBank:
                 },
             ))
 
+        # 6. Partial circle regions
+        if partial_circles:
+            for pc in partial_circles:
+                pc_start = up_len + pc["circle_start"]
+                pc_end = up_len + pc["circle_end"]
+                n_reads = pc.get("n_supporting_reads", 0)
+                frac = pc.get("circle_fraction", 0)
+                pc_size = pc.get("circle_size", pc_end - pc_start)
+                features.append(SeqFeature(
+                    FeatureLocation(pc_start, pc_end, strand=0),
+                    type="misc_feature",
+                    qualifiers={
+                        "label": [f"partial_circle_{pc_size}bp"],
+                        "note": [
+                            f"partial circle: {pc_size}bp ({frac:.0%} of IS), "
+                            f"{n_reads} supporting reads"
+                        ],
+                    },
+                ))
+
         # Build record
         description = f"{is_id} {is_length}bp IS element"
 
@@ -230,6 +256,7 @@ class ISElementGenBank:
         alignments: List[Dict],
         output_path: str,
         circle_info: Optional[Dict] = None,
+        partial_circles: Optional[List[Dict]] = None,
     ):
         """Generate and save a GenBank file for one IS element.
 
@@ -238,8 +265,9 @@ class ISElementGenBank:
             alignments: guide_hits for this element.
             output_path: path to save the .gbk file.
             circle_info: optional dict with circle_evidence fields.
+            partial_circles: optional list of partial circle calls.
         """
-        record = self.build_record(element, alignments, circle_info)
+        record = self.build_record(element, alignments, circle_info, partial_circles=partial_circles)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         SeqIO.write(record, output_path, "genbank")
 
