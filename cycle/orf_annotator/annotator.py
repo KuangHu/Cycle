@@ -111,14 +111,19 @@ class ORFAnnotator:
         return self._write_output(json_path, records)
 
     def annotate_batch(
-        self, formatter_dir: str | Path, parallel: int = 1
+        self, formatter_dir: str | Path, parallel: int = 1,
+        sample_ids: set[str] | None = None,
     ) -> dict[str, Optional[Path]]:
         """Annotate all ``*_is_records.json`` files in *formatter_dir*.
 
         Returns dict mapping sample JSON filename to output path (or None).
+        If *sample_ids* is given, only process those sample directories.
         """
         formatter_dir = Path(formatter_dir)
         json_files = sorted(formatter_dir.glob("*/*_is_records.json"))
+
+        if sample_ids is not None:
+            json_files = [jf for jf in json_files if jf.parent.name in sample_ids]
 
         if not json_files:
             logger.warning(f"No *_is_records.json files in {formatter_dir}")

@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of parallel workers. Default: 1",
     )
+    parser.add_argument(
+        "--sample-list",
+        default=None,
+        help="TSV file with 'srr_accession' column to restrict processing to those samples.",
+    )
     return parser.parse_args()
 
 
@@ -53,8 +58,14 @@ def main() -> None:
         logger.error(f"Input directory not found: {input_dir}")
         sys.exit(1)
 
+    sample_ids = None
+    if args.sample_list:
+        import pandas as pd
+        sample_ids = set(pd.read_csv(args.sample_list, sep="\t")["srr_accession"])
+        logger.info(f"Restricting to {len(sample_ids)} samples from {args.sample_list}")
+
     annotator = ORFAnnotator()
-    results = annotator.annotate_batch(input_dir, parallel=args.parallel)
+    results = annotator.annotate_batch(input_dir, parallel=args.parallel, sample_ids=sample_ids)
 
     succeeded = sum(1 for v in results.values() if v is not None)
     logger.info(f"Done: {succeeded}/{len(results)} samples annotated successfully")
