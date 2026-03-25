@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum mismatches allowed. Default: 1",
     )
     parser.add_argument(
+        "--min-length-for-mismatch",
+        type=int,
+        default=12,
+        help="Minimum alignment length when mismatches > 0. Default: 12",
+    )
+    parser.add_argument(
         "--sample-list",
         default=None,
         help="TSV file with 'srr_accession' column to restrict processing to those samples.",
@@ -79,6 +85,7 @@ def main() -> None:
     gf = GuideFinder(
         min_length=args.min_length,
         max_mismatches=args.max_mismatches,
+        min_length_for_mismatch=args.min_length_for_mismatch,
     )
     results = gf.find_guides_batch(input_dir, parallel=args.parallel, sample_ids=sample_ids)
 

@@ -1,16 +1,17 @@
 """
-IS110 Circular Element Filter
+IS110 Element Filter
 
-Identifies IS elements that:
-  1. Have tail-head junction reads (circle_evidence.n_tail_head_reads > 0)
-  2. Contain IS110-family transposase — requires BOTH DEDD and Tnp20 domains:
-     a. Single ORF with both DEDD and Tnp20 HMM hits, OR
-     b. Two adjacent ORFs (within max_orf_gap bp), one with DEDD and one with Tnp20
+Identifies IS elements containing IS110-family transposase (DEDD + Tnp20 domains).
+Splits results into two groups:
+  - with_circle_evidence: tail-head junction reads > 0 (or partial circle detected)
+  - without_circle_evidence: IS110 transposase but no circle evidence
 
 Workflow:
   1. Run hmmsearch with DEDD.hmm and Tnp20.hmm against a protein FASTA
   2. Parse hits at protein level, require both domains per transposon
-  3. Scan *_is_records_guide.json files, emit records matching both criteria
+  3. Scan *_is_records_guide.json files, split IS110 records by circle evidence
+  4. Load partial circle data for additional circle evidence
+  5. Export JSON + TSV summaries and generate PNG + GBK visualizations
 """
 
 import csv
@@ -18,7 +19,6 @@ import json
 import logging
 import os
 import subprocess
-import tempfile
 from collections import defaultdict
 from glob import glob
 from typing import Dict, List, Optional, Set, Tuple
@@ -30,7 +30,7 @@ DEFAULT_TNP20_HMM = "/home/kuangh/scripts/IS110/hmm/Tnp20.hmm"
 
 
 class IS110Filter:
-    """Filter IS elements for IS110 transposase + tail-head circular junctions."""
+    """Filter IS elements for IS110 transposase, split by circle evidence."""
 
     def __init__(
         self,
@@ -87,7 +87,6 @@ class IS110Filter:
         os.makedirs(output_dir, exist_ok=True)
 
         # Run hmmsearch for each domain, collect per-protein hits
-        # protein_hits[domain] = {protein_id: (transposon_id, start, end, strand)}
         protein_hits: Dict[str, Dict[str, Tuple[str, int, int, str]]] = {}
         for name, hmm in [("DEDD", self.dedd_hmm), ("Tnp20", self.tnp20_hmm)]:
             tbl = os.path.join(output_dir, f"{name}_hits.tbl")
@@ -100,6 +99,12 @@ class IS110Filter:
                 len({v[0] for v in hits.values()}),
             )
 
+        return self._identify_is110(protein_hits)
+
+    def _identify_is110(
+        self, protein_hits: Dict[str, Dict[str, Tuple[str, int, int, str]]],
+    ) -> Tuple[Set[str], Dict[str, Dict[str, List[Tuple[str, int, int, str]]]]]:
+        """Apply two-case logic to identify IS110 transposons from HMM hits."""
         # Group proteins by transposon and domain
         trans_domains: Dict[str, Dict[str, List[Tuple[str, int, int, str]]]] = defaultdict(
             lambda: {"DEDD": [], "Tnp20": []}
@@ -186,36 +191,72 @@ class IS110Filter:
         return hits
 
     # ------------------------------------------------------------------
-    # Step 3: filter records
+    # Step 3: load partial circle data
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def load_partial_circles(partial_circle_dirs: List[str]) -> Dict[str, List[Dict]]:
+        """Load partial circle calls, keyed by is_id.
+
+        Args:
+            partial_circle_dirs: list of directories containing
+                *_partial_circle_summary.json files (searched recursively).
+
+        Returns:
+            dict mapping is_id -> list of partial circle call dicts.
+        """
+        pc_by_is: Dict[str, List[Dict]] = {}
+        for pc_dir in partial_circle_dirs:
+            if not os.path.isdir(pc_dir):
+                continue
+            for pcf in glob(os.path.join(pc_dir, "**/*_partial_circle_summary.json"),
+                            recursive=True):
+                with open(pcf) as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    for call in data:
+                        is_id = call.get("is_id", "")
+                        if is_id:
+                            pc_by_is.setdefault(is_id, []).append(call)
+        logger.info("Loaded partial circle data for %d IS elements", len(pc_by_is))
+        return pc_by_is
+
+    # ------------------------------------------------------------------
+    # Step 4: filter and split records
     # ------------------------------------------------------------------
 
     def filter_records(
         self,
         formatter_dir: str,
         is110_ids: Set[str],
-        min_tail_head: int = 1,
         trans_domains: Optional[Dict] = None,
-    ) -> List[Dict]:
-        """Scan guide JSONs, return records with IS110 protein AND tail-head reads.
+        partial_circle_ids: Optional[Set[str]] = None,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Scan guide JSONs, split IS110 records by circle evidence.
+
+        Circle evidence = tail-head reads > 0 OR partial circle detected.
 
         Args:
             formatter_dir: directory with sample subdirs containing *_is_records_guide.json.
             is110_ids: set of transposon IDs that contain IS110 protein.
-            min_tail_head: minimum n_tail_head_reads to pass filter.
             trans_domains: if provided, annotate each ORF with its domain hits.
+            partial_circle_ids: set of is_ids with partial circle evidence.
 
         Returns:
-            List of matching record dicts (with domain annotations if trans_domains given).
+            (with_circle, without_circle) — two lists of record dicts.
         """
         json_files = sorted(glob(os.path.join(formatter_dir, "*", "*_is_records_guide.json")))
         if not json_files:
             logger.warning("No guide JSON files found under %s", formatter_dir)
-            return []
+            return [], []
 
-        matched = []
+        if partial_circle_ids is None:
+            partial_circle_ids = set()
+
+        with_circle = []
+        without_circle = []
         total_scanned = 0
         total_is110 = 0
-        total_circular = 0
 
         for jf in json_files:
             with open(jf) as f:
@@ -224,40 +265,40 @@ class IS110Filter:
             for rec in records:
                 total_scanned += 1
                 is_id = rec.get("is_id", "")
-                has_is110 = is_id in is110_ids
+                if is_id not in is110_ids:
+                    continue
+
+                total_is110 += 1
+                if trans_domains:
+                    self._annotate_orf_domains(rec, trans_domains)
+
                 ce = rec.get("circle_evidence", {})
                 n_th = ce.get("n_tail_head_reads", 0)
-                has_circle = n_th >= min_tail_head
+                has_full = n_th > 0
+                has_partial = is_id in partial_circle_ids
 
-                if has_is110:
-                    total_is110 += 1
-                if has_circle:
-                    total_circular += 1
-                if has_is110 and has_circle:
-                    if trans_domains:
-                        self._annotate_orf_domains(rec, trans_domains)
-                    matched.append(rec)
+                if has_full or has_partial:
+                    rec["_circle_type"] = "full" if has_full else "partial"
+                    with_circle.append(rec)
+                else:
+                    rec["_circle_type"] = "none"
+                    without_circle.append(rec)
 
         logger.info(
-            "Scanned %d records: %d IS110, %d circular (TH>=%d), %d both",
-            total_scanned, total_is110, total_circular, min_tail_head, len(matched),
+            "Scanned %d records: %d IS110, %d with circle evidence, %d without",
+            total_scanned, total_is110, len(with_circle), len(without_circle),
         )
-        return matched
+        return with_circle, without_circle
 
     @staticmethod
     def _annotate_orf_domains(rec: Dict, trans_domains: Dict) -> None:
-        """Add 'domains' list to each ORF that has DEDD/Tnp20 hits.
-
-        Matches protein hits to ORFs by comparing (start, end) coordinates.
-        The protein header encodes ORF coords as {is_id}__{start}_{end}_{strand}.
-        """
+        """Add 'domains' list to each ORF that has DEDD/Tnp20 hits."""
         is_id = rec.get("is_id", "")
         domains_info = trans_domains.get(is_id)
         if not domains_info:
             return
 
         orfs = rec.get("orf_annotation", {}).get("orfs", [])
-        # Build lookup: (start, end) -> set of domain names
         coord_domains: Dict[Tuple[int, int], List[str]] = defaultdict(list)
         for domain_name in ("DEDD", "Tnp20"):
             for _prot_id, start, end, _strand in domains_info.get(domain_name, []):
@@ -269,30 +310,42 @@ class IS110Filter:
                 orf["domains"] = sorted(set(coord_domains[orf_key]))
 
     # ------------------------------------------------------------------
-    # Step 4: export
+    # Step 5: export
     # ------------------------------------------------------------------
 
     def export_results(
         self,
-        records: List[Dict],
+        with_circle: List[Dict],
+        without_circle: List[Dict],
         output_dir: str,
     ):
-        """Write filtered records as JSON and summary TSV.
+        """Write split results as JSON and summary TSV.
 
         Outputs:
-            {output_dir}/is110_circular_records.json  — full records
-            {output_dir}/is110_circular_summary.tsv   — one-line-per-record summary
+            {output_dir}/with_circle_evidence/
+                is110_records.json + is110_summary.tsv
+            {output_dir}/without_circle_evidence/
+                is110_records.json + is110_summary.tsv
         """
-        os.makedirs(output_dir, exist_ok=True)
+        for label, records in [
+            ("with_circle_evidence", with_circle),
+            ("without_circle_evidence", without_circle),
+        ]:
+            sub_dir = os.path.join(output_dir, label)
+            os.makedirs(sub_dir, exist_ok=True)
+            self._write_json_and_tsv(records, sub_dir)
 
-        json_path = os.path.join(output_dir, "is110_circular_records.json")
+    @staticmethod
+    def _write_json_and_tsv(records: List[Dict], output_dir: str):
+        """Write records as JSON and summary TSV to output_dir."""
+        json_path = os.path.join(output_dir, "is110_records.json")
         with open(json_path, "w") as f:
             json.dump(records, f, indent=2)
         logger.info("Wrote %d records to %s", len(records), json_path)
 
-        tsv_path = os.path.join(output_dir, "is110_circular_summary.tsv")
+        tsv_path = os.path.join(output_dir, "is110_summary.tsv")
         fields = [
-            "is_id", "sample_id", "is_length", "n_orfs",
+            "is_id", "sample_id", "is_length", "n_orfs", "circle_type",
             "n_tail_head_reads", "n_genome_head_reads", "n_tail_genome_reads",
             "n_guide_hits", "best_guide_length",
         ]
@@ -306,7 +359,8 @@ class IS110Filter:
                     "is_id": rec.get("is_id", ""),
                     "sample_id": rec.get("sample_id", ""),
                     "is_length": rec.get("is_element", {}).get("length", 0),
-                    "n_orfs": rec.get("orf_annotation", {}).get("num_orfs", 0),
+                    "n_orfs": (rec.get("orf_annotation") or {}).get("num_orfs", 0),
+                    "circle_type": rec.get("_circle_type", ""),
                     "n_tail_head_reads": ce.get("n_tail_head_reads", 0),
                     "n_genome_head_reads": ce.get("n_genome_head_reads", 0),
                     "n_tail_genome_reads": ce.get("n_tail_genome_reads", 0),
@@ -316,34 +370,129 @@ class IS110Filter:
         logger.info("Wrote summary to %s", tsv_path)
 
     # ------------------------------------------------------------------
+    # Step 6: visualize
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def visualize(
+        records: List[Dict],
+        output_dir: str,
+        pc_by_is: Optional[Dict[str, List[Dict]]] = None,
+        dpi: int = 150,
+    ) -> Tuple[int, int]:
+        """Generate PNG + GBK for each record.
+
+        Args:
+            records: list of IS110 record dicts.
+            output_dir: directory for PNG and GBK files.
+            pc_by_is: partial circle data keyed by is_id.
+            dpi: PNG resolution.
+
+        Returns:
+            (n_done, n_errors)
+        """
+        from cycle.visualizer.visualizer import ISElementVisualizer
+        from cycle.visualizer.genbank import ISElementGenBank
+
+        os.makedirs(output_dir, exist_ok=True)
+        vis = ISElementVisualizer()
+        gb = ISElementGenBank()
+
+        if pc_by_is is None:
+            pc_by_is = {}
+
+        n_done = 0
+        n_err = 0
+
+        for rec in records:
+            is_id = rec["is_id"]
+            sample_id = rec["sample_id"]
+            tag = f"{sample_id}__{is_id[:8]}"
+            png_path = os.path.join(output_dir, f"{tag}.png")
+            gbk_path = os.path.join(output_dir, f"{tag}.gbk")
+            alignments = rec.get("guide_hits", [])
+            circle_info = rec.get("circle_evidence")
+            partial_circles = pc_by_is.get(is_id)
+
+            try:
+                vis.save_element_png(
+                    rec, alignments, png_path, dpi=dpi,
+                    circle_info=circle_info, partial_circles=partial_circles,
+                )
+                gb.save_genbank(rec, alignments, gbk_path, circle_info=circle_info)
+                n_done += 1
+            except Exception as e:
+                logger.error("Failed %s: %s", tag, e)
+                n_err += 1
+
+            if n_done % 100 == 0 and n_done > 0:
+                logger.info("  %d/%d done", n_done, len(records))
+
+        logger.info("Visualized: %d PNG+GBK, %d errors", n_done, n_err)
+        return n_done, n_err
+
+    # ------------------------------------------------------------------
     # All-in-one
     # ------------------------------------------------------------------
 
     def run(
         self,
         protein_fasta: str,
-        formatter_dir: str,
+        formatter_dirs: List[str],
         output_dir: str,
         cpus: int = 8,
-        min_tail_head: int = 1,
-    ) -> List[Dict]:
-        """Full pipeline: hmmsearch → filter → export.
+        partial_circle_dirs: Optional[List[str]] = None,
+        visualize: bool = True,
+        dpi: int = 150,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Full pipeline: hmmsearch → filter → export → visualize.
 
         Args:
-            protein_fasta: path to all_proteins.faa from system clustering.
-            formatter_dir: directory with sample subdirs containing guide JSONs.
+            protein_fasta: path to all_proteins.faa.
+            formatter_dirs: list of formatter output directories.
             output_dir: directory for output files.
             cpus: threads for hmmsearch.
-            min_tail_head: minimum tail-head reads to pass.
+            partial_circle_dirs: directories with partial circle summaries.
+            visualize: whether to generate PNG + GBK.
+            dpi: PNG resolution.
 
         Returns:
-            List of matching record dicts.
+            (with_circle, without_circle) record lists.
         """
         is110_ids, trans_domains = self.run_hmmsearch(protein_fasta, output_dir, cpus=cpus)
-        records = self.filter_records(
-            formatter_dir, is110_ids,
-            min_tail_head=min_tail_head,
-            trans_domains=trans_domains,
+
+        # Load partial circle data
+        pc_by_is: Dict[str, List[Dict]] = {}
+        partial_circle_ids: Set[str] = set()
+        if partial_circle_dirs:
+            pc_by_is = self.load_partial_circles(partial_circle_dirs)
+            partial_circle_ids = set(pc_by_is.keys())
+
+        # Filter and split across all formatter dirs
+        all_with = []
+        all_without = []
+        for fmt_dir in formatter_dirs:
+            w, wo = self.filter_records(
+                fmt_dir, is110_ids,
+                trans_domains=trans_domains,
+                partial_circle_ids=partial_circle_ids,
+            )
+            all_with.extend(w)
+            all_without.extend(wo)
+
+        logger.info(
+            "Total: %d with circle evidence, %d without",
+            len(all_with), len(all_without),
         )
-        self.export_results(records, output_dir)
-        return records
+
+        # Export
+        self.export_results(all_with, all_without, output_dir)
+
+        # Visualize
+        if visualize:
+            wc_dir = os.path.join(output_dir, "with_circle_evidence")
+            wo_dir = os.path.join(output_dir, "without_circle_evidence")
+            self.visualize(all_with, wc_dir, pc_by_is=pc_by_is, dpi=dpi)
+            self.visualize(all_without, wo_dir, pc_by_is=pc_by_is, dpi=dpi)
+
+        return all_with, all_without

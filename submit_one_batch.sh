@@ -15,24 +15,25 @@
 #
 #   Phase 1 chunk_0 → Phase 2 chunk_0 ─┐
 #   Phase 1 chunk_1 → Phase 2 chunk_1 ─┤
-#   Phase 1 chunk_2 → Phase 2 chunk_2 ─┼→ Phase 3 → Phase 4 chunk_0 ─┐
-#   Phase 1 chunk_3 → Phase 2 chunk_3 ─┤            Phase 4 chunk_1 ─┤
-#   Phase 1 chunk_4 → Phase 2 chunk_4 ─┘            Phase 4 chunk_2 ─┼→ Phase 5
-#                                                    Phase 4 chunk_3 ─┤
-#                                                    Phase 4 chunk_4 ─┘
+#   Phase 1 chunk_2 → Phase 2 chunk_2 ─┼→ Phase 3 → Phase 4 chunk_0
+#   Phase 1 chunk_3 → Phase 2 chunk_3 ─┤            Phase 4 chunk_1
+#   Phase 1 chunk_4 → Phase 2 chunk_4 ─┘            Phase 4 chunk_2
+#                                                    Phase 4 chunk_3
+#                                                    Phase 4 chunk_4
 #
 #   1  Download + Resolve + Align + Sniffles + Format   (N nodes, ~2-3 days)
 #   2  ORF annotation + Guide finder                    (N nodes, ~1 hour)
 #   3  Clustering + Novelty                             (1 node, ~6 hours)
 #   4  Partial circle                                   (N nodes, ~2 hours)
-#   5  Cleanup                                          (1 node, ~1 hour)
+#
+# Cleanup is manual — verify all phases completed, then delete chunks/ and assembly/ dirs.
 #
 # All N nodes start immediately in Phase 1. Each chunk is independent.
 # Resolve/index is idempotent — multiple nodes can do it safely.
 #
 # Automatically detects samples with existing guide.json and skips
 # them for phases 1-2 (but still downloads their FASTQs for phase 4).
-# Cleanup deletes FASTQs, BAMs, VCFs, circle intermediates, and assembly dirs.
+# After verifying all phases, manually delete chunks/ and assembly/ dirs.
 
 set -e
 
@@ -60,7 +61,7 @@ if [[ -z "$BATCH_NUM" ]]; then
     echo "  2  ORF annotation + Guide finder         (N nodes, ~1 hour)"
     echo "  3  Clustering + Novelty                  (1 node, ~6 hours)"
     echo "  4  Partial circle                        (N nodes, ~2 hours)"
-    echo "  5  Cleanup                               (1 node, ~1 hour)"
+    echo "  Cleanup: manual after verifying all phases completed"
     exit 1
 fi
 
@@ -293,6 +294,7 @@ P3_JOBID=$(sbatch --parsable \
     --partition=standard --qos=standard \
     --nodes=1 --cpus-per-task=48 --mem=192G \
     --time=12:00:00 \
+    --exclude="node-48-256g-2,node-48-256g-3,node-48-256g-8,node-48-256g-9,node-48-256g-12,node-48-256g-13,node-48-256g-14,node-48-256g-17,node-48-256g-18,node-48-256g-19,node-48-256g-20" \
     --output="$LOGDIR/${batch_name}_p3_%j.out" \
     --error="$LOGDIR/${batch_name}_p3_%j.err" \
     --dependency="afterok:${P2_DEP}" \
@@ -319,11 +321,12 @@ for i in $(seq 0 $((NODES - 1))); do
     cat > "$PC_SCRIPT" << PCEOF
 import os, subprocess, sys
 sys.path.insert(0, "$CYCLE_DIR")
+from pathlib import Path
 from cycle.utils import find_fastq
 import pandas as pd
 
 chunk_meta = pd.read_csv("$ALL_TSV", sep="\t")
-sra_dir = "$CDIR/sra_downloads"
+sra_dir = Path("$CDIR/sra_downloads")
 pc_dir = "$PC_DIR"
 fmt_dir = "$FMT_DIR"
 os.makedirs(pc_dir, exist_ok=True)
@@ -375,36 +378,8 @@ echo '=== Phase 4 chunk $i done ==='"
     echo "  chunk $i: Job $jobid"
 done
 
-P4_DEP=$(IFS=:; echo "${P4_JOBIDS[*]}")
-
-# ── Phase 5: Cleanup (1 node) ──────────────────────────────────────
-# Deletes chunk working dirs (FASTQs, BAMs, VCFs) and assembly dirs.
-echo ""
-echo "Phase 5: Cleanup (1 node)"
-
-P5_CMD="$ENV_SETUP && \\
-echo '=== Phase 5: Cleanup ===' && \\
-echo 'Deleting chunk working directories (FASTQs, BAMs, VCFs, circle intermediates)...' && \\
-rm -rf '$CHUNK_DIR' && \\
-echo 'Deleting assembly directories...' && \\
-find '$FMT_DIR' -maxdepth 2 -type d -name assembly -exec rm -rf {} + 2>/dev/null; \\
-echo '=== Cleanup done ===' && \\
-du -sh '$BATCH_DIR'"
-
-P5_JOBID=$(sbatch --parsable \
-    --job-name="${batch_name}_p5" \
-    --partition=standard --qos=standard \
-    --nodes=1 --cpus-per-task=4 --mem=16G \
-    --time=6:00:00 \
-    --output="$LOGDIR/${batch_name}_p5_%j.out" \
-    --error="$LOGDIR/${batch_name}_p5_%j.err" \
-    --dependency="afterok:${P4_DEP}" \
-    --wrap="$P5_CMD")
-
-echo "  Job $P5_JOBID"
-
 # ── Summary ────────────────────────────────────────────────────────
-TOTAL_JOBS=$((${#P1_JOBIDS[@]} + ${#P2_JOBIDS[@]} + 1 + ${#P4_JOBIDS[@]} + 1))
+TOTAL_JOBS=$((${#P1_JOBIDS[@]} + ${#P2_JOBIDS[@]} + 1 + ${#P4_JOBIDS[@]}))
 echo ""
 echo "=========================================="
 echo "Submitted $TOTAL_JOBS jobs for $batch_name"
@@ -414,7 +389,11 @@ echo "Phase 1 (download+format): ${P1_JOBIDS[*]}  ← start immediately"
 echo "Phase 2 (orf+guide):       ${P2_JOBIDS[*]:-skipped}"
 echo "Phase 3 (cluster+novelty): $P3_JOBID"
 echo "Phase 4 (partial circle):  ${P4_JOBIDS[*]}"
-echo "Phase 5 (cleanup):         $P5_JOBID"
 echo ""
 echo "Monitor: squeue -u \$(whoami) -n ${batch_name}_p"
 echo "Logs:    tail -f $LOGDIR/${batch_name}_p*.err"
+echo ""
+echo "After verifying all phases completed, run cleanup manually:"
+echo "  rm -rf $CHUNK_DIR/chunk_*/sra_downloads $CHUNK_DIR/chunk_*/alignments"
+echo "  find $BATCH_DIR -name '*.bam' -delete && find $BATCH_DIR -name '*.bam.bai' -delete"
+echo "  find $FMT_DIR -maxdepth 2 -type d -name assembly -exec rm -rf {} +"

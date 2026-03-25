@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 """
-Find IS elements with IS110 transposase AND tail-head circular junctions.
+Find IS elements with IS110 transposase, split by circle evidence.
 
 Usage:
     python scripts/run_is110_filter.py \
         --protein-fasta /path/to/all_proteins.faa \
-        --input-dir /path/to/is_formatter_output \
-        --output-dir /path/to/is110_circular \
-        --cpus 8 \
-        --min-tail-head 1
+        --input-dirs /path/to/batch_006/is_formatter_output \
+                     /path/to/batch_007/is_formatter_output \
+        --output-dir /path/to/is110_output \
+        --partial-circle-dirs /path/to/batch_006/partial_circle_output \
+                              /path/to/batch_007/partial_circle_output \
+        --cpus 8
 """
 
 import argparse
@@ -23,27 +25,27 @@ from cycle.is110_filter import IS110Filter
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter IS elements for IS110 protein + tail-head circular junctions.",
+        description="Filter IS elements for IS110 protein, split by circle evidence.",
     )
     parser.add_argument(
         "--protein-fasta", required=True,
-        help="Path to all_proteins.faa from system clustering.",
+        help="Path to all_proteins.faa.",
     )
     parser.add_argument(
-        "--input-dir", required=True,
-        help="Directory containing sample subdirs with *_is_records_guide.json.",
+        "--input-dirs", nargs="+", required=True,
+        help="Formatter output directories containing */*_is_records_guide.json.",
     )
     parser.add_argument(
         "--output-dir", required=True,
-        help="Output directory for filtered results.",
+        help="Output directory for results.",
+    )
+    parser.add_argument(
+        "--partial-circle-dirs", nargs="+", default=None,
+        help="Directories with *_partial_circle_summary.json files.",
     )
     parser.add_argument(
         "--cpus", type=int, default=8,
         help="Threads for hmmsearch (default: 8).",
-    )
-    parser.add_argument(
-        "--min-tail-head", type=int, default=1,
-        help="Minimum n_tail_head_reads to pass filter (default: 1).",
     )
     parser.add_argument(
         "--evalue", type=float, default=1e-5,
@@ -57,6 +59,14 @@ def main():
         "--skip-hmmsearch", action="store_true",
         help="Skip hmmsearch; reuse existing DEDD_hits.tbl and Tnp20_hits.tbl in output-dir.",
     )
+    parser.add_argument(
+        "--no-visualize", action="store_true",
+        help="Skip PNG + GBK generation.",
+    )
+    parser.add_argument(
+        "--dpi", type=int, default=150,
+        help="PNG resolution (default: 150).",
+    )
 
     args = parser.parse_args()
 
@@ -69,7 +79,6 @@ def main():
 
     if args.skip_hmmsearch:
         logging.info("Reusing existing hmmsearch results in %s", args.output_dir)
-        # Parse both tblout files, then apply the same two-case logic
         protein_hits = {}
         for name in ("DEDD", "Tnp20"):
             tbl = os.path.join(args.output_dir, f"{name}_hits.tbl")
@@ -81,46 +90,44 @@ def main():
                 protein_hits[name] = {}
                 logging.warning("%s tblout not found: %s", name, tbl)
 
-        # Apply same two-case logic as run_hmmsearch
-        from collections import defaultdict
-        trans_domains = defaultdict(lambda: {"DEDD": [], "Tnp20": []})
-        for domain, hits in protein_hits.items():
-            for prot_id, (trans_id, start, end, strand) in hits.items():
-                trans_domains[trans_id][domain].append((prot_id, start, end, strand))
+        is110_ids, trans_domains = filt._identify_is110(protein_hits)
 
-        is110_ids = set()
-        n_case1 = n_case2 = 0
-        for trans_id, domains in trans_domains.items():
-            dedd_prots = {p[0] for p in domains["DEDD"]}
-            tnp20_prots = {p[0] for p in domains["Tnp20"]}
-            if dedd_prots & tnp20_prots:
-                is110_ids.add(trans_id)
-                n_case1 += 1
-                continue
-            if dedd_prots and tnp20_prots:
-                if filt._has_adjacent_pair(domains["DEDD"], domains["Tnp20"]):
-                    is110_ids.add(trans_id)
-                    n_case2 += 1
+        # Load partial circle data
+        pc_by_is = {}
+        partial_circle_ids = set()
+        if args.partial_circle_dirs:
+            pc_by_is = filt.load_partial_circles(args.partial_circle_dirs)
+            partial_circle_ids = set(pc_by_is.keys())
 
-        logging.info(
-            "IS110: %d transposons (case1=%d same-ORF, case2=%d adjacent-ORFs, "
-            "rejected %d single-domain)",
-            len(is110_ids), n_case1, n_case2,
-            len(trans_domains) - len(is110_ids),
-        )
-        records = filt.filter_records(
-            args.input_dir, is110_ids,
-            min_tail_head=args.min_tail_head,
-            trans_domains=dict(trans_domains),
-        )
-        filt.export_results(records, args.output_dir)
+        # Filter and split
+        all_with = []
+        all_without = []
+        for fmt_dir in args.input_dirs:
+            w, wo = filt.filter_records(
+                fmt_dir, is110_ids,
+                trans_domains=trans_domains,
+                partial_circle_ids=partial_circle_ids,
+            )
+            all_with.extend(w)
+            all_without.extend(wo)
+
+        logging.info("Total: %d with circle, %d without", len(all_with), len(all_without))
+        filt.export_results(all_with, all_without, args.output_dir)
+
+        if not args.no_visualize:
+            wc_dir = os.path.join(args.output_dir, "with_circle_evidence")
+            wo_dir = os.path.join(args.output_dir, "without_circle_evidence")
+            filt.visualize(all_with, wc_dir, pc_by_is=pc_by_is, dpi=args.dpi)
+            filt.visualize(all_without, wo_dir, pc_by_is=pc_by_is, dpi=args.dpi)
     else:
         filt.run(
             protein_fasta=args.protein_fasta,
-            formatter_dir=args.input_dir,
+            formatter_dirs=args.input_dirs,
             output_dir=args.output_dir,
             cpus=args.cpus,
-            min_tail_head=args.min_tail_head,
+            partial_circle_dirs=args.partial_circle_dirs,
+            visualize=not args.no_visualize,
+            dpi=args.dpi,
         )
 
     logging.info("Done.")

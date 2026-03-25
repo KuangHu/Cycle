@@ -19,12 +19,18 @@ def reverse_complement(seq: str) -> str:
 class ShortAlignmentFinder:
     """Find short DNA alignments between two sequences.
 
+    Uses a tiered mismatch rule:
+      - Exact match (0 mismatches): min_length (default 9bp)
+      - With mismatches (≤ max_mismatches): min_length_for_mismatch (default 12bp)
+
     Parameters
     ----------
     min_length : int
-        Minimum alignment length to report.
+        Minimum alignment length for exact (0 mismatch) hits.
     max_mismatches : int
-        Maximum number of mismatches allowed.
+        Maximum number of mismatches allowed for longer hits.
+    min_length_for_mismatch : int
+        Minimum alignment length required when mismatches > 0.
     check_forward : bool
         Find direct (forward-forward) matches.
     check_revcomp : bool
@@ -35,6 +41,7 @@ class ShortAlignmentFinder:
         self,
         min_length: int = 9,
         max_mismatches: int = 1,
+        min_length_for_mismatch: int = 12,
         check_forward: bool = True,
         check_revcomp: bool = True,
     ) -> None:
@@ -47,12 +54,26 @@ class ShortAlignmentFinder:
 
         self.min_length = min_length
         self.max_mismatches = max_mismatches
+        self.min_length_for_mismatch = min_length_for_mismatch
         self.check_forward = check_forward
         self.check_revcomp = check_revcomp
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _passes_mismatch_filter(self, length: int, mismatches: int) -> bool:
+        """Check if a hit passes the tiered mismatch rule.
+
+        - length >= min_length with 0 mismatches: always OK
+        - length >= min_length_for_mismatch with <= max_mismatches: OK
+        - otherwise: rejected
+        """
+        if mismatches == 0 and length >= self.min_length:
+            return True
+        if mismatches <= self.max_mismatches and length >= self.min_length_for_mismatch:
+            return True
+        return False
 
     def find_alignments_between(
         self, sequence1: str, sequence2: str
@@ -80,7 +101,7 @@ class ShortAlignmentFinder:
         extended = []
         for seed in seeds:
             ext = self._extend_match_between(sequence1, sequence2, seed)
-            if ext:
+            if ext and self._passes_mismatch_filter(ext["length"], ext["mismatches"]):
                 extended.append(ext)
 
         consolidated = self._consolidate_matches_between(extended)
@@ -106,7 +127,7 @@ class ShortAlignmentFinder:
                 for j in range(len2 - ml + 1):
                     target = sequence2[j : j + ml]
                     mm, mm_pos = self._count_mismatches(kmer, target)
-                    if mm <= self.max_mismatches:
+                    if mm == 0:
                         seeds.append(
                             {
                                 "pos1": i,
@@ -123,7 +144,7 @@ class ShortAlignmentFinder:
                 for j in range(len2 - ml + 1):
                     target = sequence2[j : j + ml]
                     mm, mm_pos = self._count_mismatches(kmer_rc, target)
-                    if mm <= self.max_mismatches:
+                    if mm == 0:
                         seeds.append(
                             {
                                 "pos1": i,

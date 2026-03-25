@@ -49,6 +49,7 @@ IS_FAMILY_COLORS = {
     "unclassified": "#cccccc",
 }
 DEFAULT_ORF_COLOR = "#bbbbbb"
+CARGO_ORF_COLOR = "#4daf4a"  # green for annotated cargo genes
 DEDD_COLOR = "#e41a1c"       # red for DEDD domain ORFs
 TNP20_COLOR = "#ff7f00"      # orange for Tnp20 domain ORFs
 DEDD_TNP20_COLOR = "#984ea3" # purple for ORFs with both domains
@@ -163,6 +164,14 @@ class ISElementVisualizer:
             length_aa = length_nt // 3
 
             domains = orf.get("domains", [])
+            gene = orf.get("gene", "") or ""
+            product = orf.get("product", "") or ""
+            is_hypothetical = (
+                not product
+                or product.lower() == "hypothetical protein"
+                or product.lower().startswith("hypothetical")
+            )
+
             if "DEDD" in domains and "Tnp20" in domains:
                 color = DEDD_TNP20_COLOR
                 domain_tag = " DEDD+Tnp20"
@@ -172,11 +181,22 @@ class ISElementVisualizer:
             elif "Tnp20" in domains:
                 color = TNP20_COLOR
                 domain_tag = " Tnp20"
+            elif not is_hypothetical:
+                color = CARGO_ORF_COLOR
+                domain_tag = ""
             else:
                 color = DEFAULT_ORF_COLOR
                 domain_tag = ""
 
-            label = f"orf_{i+1} ({length_aa}aa){domain_tag}"
+            # Build label: prefer gene name, then product, fallback to orf_N
+            if gene:
+                name = gene
+            elif product and not is_hypothetical:
+                # Truncate long product names
+                name = product if len(product) <= 30 else product[:27] + "..."
+            else:
+                name = f"orf_{i+1}"
+            label = f"{name} ({length_aa}aa){domain_tag}"
 
             features.append(GraphicFeature(
                 start=orf_start,

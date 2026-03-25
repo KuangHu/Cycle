@@ -19,12 +19,18 @@ class GuideFinder:
     against internal noncoding regions.  Alignments suggest the element
     encodes a guide that recognises its target site.
 
+    Uses tiered mismatch rule:
+      - Exact (0 mm): min_length (default 9bp)
+      - With mismatches: min_length_for_mismatch (default 12bp)
+
     Parameters
     ----------
     min_length : int
-        Minimum alignment length (default 9).
+        Minimum alignment length for exact matches (default 9).
     max_mismatches : int
-        Maximum mismatches allowed (default 1).
+        Maximum mismatches allowed for longer hits (default 1).
+    min_length_for_mismatch : int
+        Minimum alignment length when mismatches > 0 (default 12).
     check_revcomp : bool
         Also search reverse-complement orientations (default True).
     """
@@ -33,11 +39,13 @@ class GuideFinder:
         self,
         min_length: int = 9,
         max_mismatches: int = 1,
+        min_length_for_mismatch: int = 12,
         check_revcomp: bool = True,
     ) -> None:
         self.aligner = ShortAlignmentFinder(
             min_length=min_length,
             max_mismatches=max_mismatches,
+            min_length_for_mismatch=min_length_for_mismatch,
             check_forward=True,
             check_revcomp=check_revcomp,
         )
@@ -135,6 +143,7 @@ class GuideFinder:
                         jf,
                         self.aligner.min_length,
                         self.aligner.max_mismatches,
+                        self.aligner.min_length_for_mismatch,
                         self.aligner.check_revcomp,
                     )
                     futures[fut] = jf.name
@@ -238,12 +247,14 @@ def _guide_worker(
     json_path: Path,
     min_length: int,
     max_mismatches: int,
+    min_length_for_mismatch: int,
     check_revcomp: bool,
 ) -> Optional[Path]:
     """Standalone worker for ProcessPoolExecutor."""
     gf = GuideFinder(
         min_length=min_length,
         max_mismatches=max_mismatches,
+        min_length_for_mismatch=min_length_for_mismatch,
         check_revcomp=check_revcomp,
     )
     return gf.find_guides_sample(json_path)

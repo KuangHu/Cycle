@@ -24,18 +24,23 @@ class Aligner:
     ``samtools sort`` with no intermediate SAM on disk.
     """
 
+    # Default per-sample alignment timeout in seconds (2 hours)
+    DEFAULT_TIMEOUT = 7200
+
     def __init__(
         self,
         output_dir: str = DEFAULT_ALIGNMENT_DIR,
         preset: str = DEFAULT_MINIMAP2_PRESET,
         threads: int = DEFAULT_THREADS,
         sort_memory: str = DEFAULT_SORT_MEMORY,
+        timeout: int = DEFAULT_TIMEOUT,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.preset = preset
         self.threads = threads
         self.sort_memory = sort_memory
+        self.timeout = timeout
 
         for tool in ("minimap2", "samtools"):
             if not shutil.which(tool):
@@ -138,7 +143,7 @@ class Aligner:
             # Allow mm2 to receive SIGPIPE if sort exits early
             mm2_proc.stdout.close()
 
-            sort_out, sort_err = sort_proc.communicate()
+            sort_out, sort_err = sort_proc.communicate(timeout=self.timeout)
             mm2_err = mm2_proc.stderr.read()
             mm2_proc.stderr.close()
             mm2_proc.wait()
@@ -149,6 +154,19 @@ class Aligner:
                     f"{sort_err.decode().strip()}"
                 )
                 return None
+
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"TIMEOUT: {sample_id} exceeded {self.timeout}s — killing and skipping"
+            )
+            sort_proc.kill()
+            mm2_proc.kill()
+            sort_proc.wait()
+            mm2_proc.wait()
+            # Clean up partial BAM
+            if bam.exists():
+                bam.unlink()
+            return None
 
         except Exception as exc:
             logger.error(f"Alignment pipeline failed for {sample_id}: {exc}")
