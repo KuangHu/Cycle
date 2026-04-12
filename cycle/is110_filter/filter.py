@@ -232,61 +232,71 @@ class IS110Filter:
         trans_domains: Optional[Dict] = None,
         partial_circle_ids: Optional[Set[str]] = None,
     ) -> Tuple[List[Dict], List[Dict]]:
-        """Scan guide JSONs, split IS110 records by circle evidence.
+        """Scan IS records, split IS110 by circle evidence.
+
+        Scans guide JSONs for records with circle evidence, then scans
+        annotated JSONs to find IS110 records without circle evidence
+        (which were excluded from guide JSONs by the TH filter).
 
         Circle evidence = tail-head reads > 0 OR partial circle detected.
-
-        Args:
-            formatter_dir: directory with sample subdirs containing *_is_records_guide.json.
-            is110_ids: set of transposon IDs that contain IS110 protein.
-            trans_domains: if provided, annotate each ORF with its domain hits.
-            partial_circle_ids: set of is_ids with partial circle evidence.
 
         Returns:
             (with_circle, without_circle) — two lists of record dicts.
         """
-        json_files = sorted(glob(os.path.join(formatter_dir, "*", "*_is_records_guide.json")))
-        if not json_files:
-            logger.warning("No guide JSON files found under %s", formatter_dir)
-            return [], []
-
         if partial_circle_ids is None:
             partial_circle_ids = set()
 
         with_circle = []
         without_circle = []
-        total_scanned = 0
-        total_is110 = 0
+        seen_ids: Set[str] = set()
 
-        for jf in json_files:
+        # Pass 1: guide JSONs — these have circle evidence (TH > 0)
+        guide_files = sorted(glob(os.path.join(formatter_dir, "*", "*_is_records_guide.json")))
+        for jf in guide_files:
             with open(jf) as f:
                 records = json.load(f)
-
             for rec in records:
-                total_scanned += 1
                 is_id = rec.get("is_id", "")
                 if is_id not in is110_ids:
                     continue
-
-                total_is110 += 1
                 if trans_domains:
                     self._annotate_orf_domains(rec, trans_domains)
-
                 ce = rec.get("circle_evidence", {})
                 n_th = ce.get("n_tail_head_reads", 0)
                 has_full = n_th > 0
                 has_partial = is_id in partial_circle_ids
-
                 if has_full or has_partial:
                     rec["_circle_type"] = "full" if has_full else "partial"
                     with_circle.append(rec)
                 else:
                     rec["_circle_type"] = "none"
                     without_circle.append(rec)
+                seen_ids.add(is_id)
+
+        # Pass 2: annotated JSONs — pick up IS110 records excluded by TH filter
+        ann_files = sorted(glob(os.path.join(formatter_dir, "*", "*_is_records_annotated.json")))
+        for jf in ann_files:
+            with open(jf) as f:
+                records = json.load(f)
+            for rec in records:
+                is_id = rec.get("is_id", "")
+                if is_id not in is110_ids or is_id in seen_ids:
+                    continue
+                if trans_domains:
+                    self._annotate_orf_domains(rec, trans_domains)
+                # Check if partial circle gives it circle evidence
+                if is_id in partial_circle_ids:
+                    rec["_circle_type"] = "partial"
+                    with_circle.append(rec)
+                else:
+                    rec["_circle_type"] = "none"
+                    without_circle.append(rec)
+                seen_ids.add(is_id)
 
         logger.info(
-            "Scanned %d records: %d IS110, %d with circle evidence, %d without",
-            total_scanned, total_is110, len(with_circle), len(without_circle),
+            "Scanned %s: %d IS110 total, %d with circle evidence, %d without",
+            os.path.basename(formatter_dir), len(with_circle) + len(without_circle),
+            len(with_circle), len(without_circle),
         )
         return with_circle, without_circle
 
